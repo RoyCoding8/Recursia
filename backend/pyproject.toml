@@ -1,0 +1,21 @@
+[project]
+name = "recursia-backend"
+version = "0.1.0"
+description = "FastAPI backend for Recursia recursive orchestration"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.42.85",
+    "fastapi>=0.115.0,<1.0.0",
+    "litellm>=1.83.4",
+    "pydantic>=2.8.0,<3.0.0",
+    "tenacity>=9.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.0.3",
+    "pytest-anyio>=0.0.0",
+]
