@@ -51,20 +51,21 @@ class LLMCheckerClient:
         self._llm_client = llm_client
 
     def evaluate(self, request: CheckerRequest) -> object:
+        output_str = json.dumps(
+            request.output, ensure_ascii=False, sort_keys=True)[:2000]
         prompt = (
-            "You are a strict quality checker for an agentic workflow engine. "
-            "Evaluate output against objective and return JSON with exact schema: "
-            "{verdict:'pass|fail', reason, suggested_fix, confidence, violations:[string]}. "
+            f"Evaluate this output against the objective. "
             f"Scope: {request.scope.value}. "
             f"Objective: {request.objective}. "
-            f"Output: {json.dumps(request.output, ensure_ascii=False, sort_keys=True)}"
+            f"Output: {output_str}"
         )
         return self._llm_client.generate_json(
             LLMGenerateRequest(
                 messages=[
                     LLMMessage(
                         role="system",
-                        content="Return strict JSON for checker contract.",
+                        content="Return JSON: {verdict:'pass'|'fail', reason, "
+                        "suggested_fix, confidence (0-1), violations:[string]}.",
                     ),
                     LLMMessage(role="user", content=prompt),
                 ],

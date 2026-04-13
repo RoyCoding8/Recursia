@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from app.adapters.llm_client import LLMClient, LLMGenerateRequest, LLMMessage
+from app.domain.models import NodeContext
 from app.schemas.contracts import (
     DividerBaseCase,
     DividerDecision,
@@ -85,7 +86,8 @@ class DividerService:
         self._max_schema_retries = max_schema_retries
         self._temperature = temperature
 
-    def divide(self, objective: str, depth: int = 0) -> DividerServiceResult:
+    def divide(self, objective: str, depth: int = 0,
+               node_context: NodeContext | None = None) -> DividerServiceResult:
         """Return schema-validated divide decision and normalized payload."""
         if not objective.strip():
             raise ValueError("objective must be non-empty")
@@ -98,7 +100,8 @@ class DividerService:
         for attempt in range(1, max_attempts + 1):
             response_payload = self._llm_client.generate_json(
                 request=self._build_request(
-                    objective=objective, depth=depth, attempt=attempt
+                    objective=objective, depth=depth, attempt=attempt,
+                    node_context=node_context,
                 )
             )
 
@@ -120,6 +123,7 @@ class DividerService:
         objective: str,
         depth: int,
         attempt: int,
+        node_context: NodeContext | None = None,
     ) -> LLMGenerateRequest:
         repair_hint = ""
         if attempt > 1:
@@ -128,29 +132,30 @@ class DividerService:
                 "Respond with schema-valid JSON only (no markdown/code fences)."
             )
 
+        lineage = ""
+        if node_context:
+            lineage = f"\n\nContext:\n{node_context.to_prompt_block()}"
+
         prompt = (
-            "You are a recursive divider for an agentic workflow engine. "
-            "Decide whether this objective is a BASE_CASE (single linear work plan) "
-            "or RECURSIVE_CASE (must decompose into 2+ child objectives). "
-            "Return ONLY a JSON object (no prose, no markdown) matching exactly one schema:\n\n"
-            'BASE_CASE example:\n{"decision":"BASE_CASE","rationale":"why this is a base case",'
-            '"work_plan":[{"step":1,"description":"first action"},{"step":2,"description":"second action"}],'
-            '"suggested_persona":"python_developer","needs_qa":true}\n\n'
-            'RECURSIVE_CASE example:\n{"decision":"RECURSIVE_CASE","rationale":"why decompose",'
-            '"children":[{"objective":"sub-goal 1","dependencies":[],"suggested_persona":null,"interface_contract":null,"needs_qa":true},'
-            '{"objective":"sub-goal 2","dependencies":[],"suggested_persona":null,"interface_contract":null,"needs_qa":false}]}\n\n'
-            'IMPORTANT: decision MUST be exactly "BASE_CASE" or "RECURSIVE_CASE" (uppercase). '
-            "work_plan step values MUST be integers starting at 1. "
-            "Set needs_qa to true for nodes that need quality checking, false for trivial/setup tasks.\n\n"
+            "Decide: is this a BASE_CASE (single linear work plan) or "
+            "RECURSIVE_CASE (decompose into 2+ sub-objectives)?\n\n"
+            "BASE_CASE requires: decision, rationale, work_plan (step+description), "
+            "suggested_persona, needs_qa.\n"
+            "RECURSIVE_CASE requires: decision, rationale, children (objective, "
+            "dependencies, suggested_persona, interface_contract, needs_qa).\n\n"
             f"Objective: {objective}\n"
             f"Depth: {depth}."
+            f"{lineage}"
             f"{repair_hint}"
         )
 
         return LLMGenerateRequest(
             messages=[
                 LLMMessage(
-                    role="system", content="Return strict JSON for divider contract."
+                    role="system",
+                    content="Return strict JSON for divider contract. "
+                    'decision MUST be "BASE_CASE" or "RECURSIVE_CASE". '
+                    "work_plan steps are integers starting at 1.",
                 ),
                 LLMMessage(role="user", content=prompt),
             ],

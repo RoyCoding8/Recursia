@@ -10,6 +10,7 @@ from typing import Any
 
 from app.adapters.llm_client import LLMClient, LLMGenerateRequest, LLMMessage
 from app.domain.events import DomainEventType
+from app.domain.models import NodeContext
 from app.services.persona_registry import PersonaProfile, PersonaRegistry
 
 EventEmitter = Callable[[str, str, DomainEventType, dict[str, object]], None]
@@ -75,6 +76,7 @@ class LLMBaseCaseWorker:
         depth: int,
         persona_id: str | None,
         work_plan: list[dict[str, Any]],
+        node_context: NodeContext | None = None,
     ) -> Any:
         """Execute the full work plan step-by-step and return a WorkExecutionResult."""
         from app.services.executor import WorkExecutionResult
@@ -108,9 +110,11 @@ class LLMBaseCaseWorker:
                     step_index=step_index,
                     total_steps=len(work_plan),
                     depth=depth,
-                    prior_context=accumulated_context,
+                    prior_context=self._build_sliding_context(
+                        accumulated_context, objective),
                     profile=profile,
                     workspace_dir=workspace_dir,
+                    node_context=node_context,
                 )
             except Exception as first_error:
                 # Attempt self-heal: retry with error context
@@ -156,7 +160,8 @@ class LLMBaseCaseWorker:
             )
 
             accumulated_context.append(
-                f"Step {step_index} ({step_description}): {json.dumps(step_output, ensure_ascii=False, default=str)[:500]}"
+                f"Step {step_index} ({step_description}): "
+                f"{json.dumps(step_output, ensure_ascii=False, default=str)[:300]}"
             )
 
             step_results.append(
@@ -289,10 +294,13 @@ class LLMBaseCaseWorker:
     ) -> dict[str, Any] | list[Any] | str | int | float | bool | None:
         """One retry attempt with error context injected into the prompt."""
         try:
-            heal_context = list(prior_context) + [
-                f"PREVIOUS ATTEMPT FAILED with error: {original_error}. "
-                "Please fix the issue and try a different approach."
-            ]
+            heal_ctx = self._build_sliding_context(prior_context, objective)
+            if heal_ctx:
+                heal_ctx += "\n"
+            heal_ctx += (
+                f"PREVIOUS ATTEMPT FAILED: {original_error}. "
+                "Fix the issue and try a different approach."
+            )
             return self._execute_step(
                 system_prompt=system_prompt,
                 objective=objective,
@@ -300,12 +308,25 @@ class LLMBaseCaseWorker:
                 step_index=step_index,
                 total_steps=total_steps,
                 depth=depth,
-                prior_context=heal_context,
+                prior_context=heal_ctx,
                 profile=profile,
                 workspace_dir=workspace_dir,
             )
         except Exception:
             return None
+
+    @staticmethod
+    def _build_sliding_context(steps: list[str], objective: str) -> str:
+        """Sliding window: summarize all-but-last, keep last step in full."""
+        if not steps:
+            return ""
+        if len(steps) == 1:
+            return steps[0]
+        summary_parts = [s.split(": ", 1)[0] for s in steps[:-1]]
+        return (
+            f"Completed: {'; '.join(summary_parts)}\n"
+            f"Last step detail: {steps[-1]}"
+        )
 
     def _execute_step(
         self,
@@ -316,16 +337,18 @@ class LLMBaseCaseWorker:
         step_index: int,
         total_steps: int,
         depth: int,
-        prior_context: list[str],
+        prior_context: str,
         profile: PersonaProfile | None,
         workspace_dir: Path | None = None,
+        node_context: NodeContext | None = None,
     ) -> dict[str, Any] | list[Any] | str | int | float | bool | None:
+        lineage = ""
+        if node_context:
+            lineage = f"\n\n{node_context.to_prompt_block()}"
+
         context_block = ""
         if prior_context:
-            context_block = (
-                "\n\nPrior step results (use as context for this step):\n"
-                + "\n".join(prior_context)
-            )
+            context_block = f"\n\nPrior progress:\n{prior_context}"
 
         persona_name = profile.name if profile else "General Agent"
         user_prompt = (
@@ -333,10 +356,9 @@ class LLMBaseCaseWorker:
             f"Overall objective: {objective}\n"
             f"Current step ({step_index}/{total_steps}): {step_description}\n"
             f"Tree depth: {depth}"
+            f"{lineage}"
             f"{context_block}\n\n"
-            "Execute this step. Return JSON with your result. "
-            "Include a 'reasoning' field explaining your approach and an 'output' field "
-            "with the concrete deliverable for this step."
+            "Execute this step. Return JSON with 'reasoning' and 'output' fields."
         )
 
         response = self._llm_client.generate_json(

@@ -124,9 +124,20 @@ export function ProposedFilesPanel({
 
   const applyAll = async () => {
     setApplySummary(null);
+    let ok = 0;
+    let fail = 0;
     for (const [index, proposal] of proposals.entries()) {
-      await applyProposal(proposal, index);
+      const outcome = await applyFileToDirectory(selectedFolderHandle, proposal.path, proposal.content);
+      const key = proposalKey(proposal, index);
+      const applied = outcome.status === "success";
+      setApplyStates((cur) => ({
+        ...cur,
+        [key]: { status: applied ? "applied" : "error", message: outcome.message },
+      }));
+      if (applied) ok++;
+      else fail++;
     }
+    setApplySummary(`Applied ${ok}/${proposals.length} files${fail ? ` (${fail} errors)` : ""}`);
   };
 
   function summarizeApplyState(state: ApplyState | undefined): string {
@@ -195,6 +206,7 @@ export function ProposedFilesPanel({
                 <button
                   type="button"
                   className={`proposalSelectButton ${index === selectedProposalIndex ? "proposalSelectButtonActive" : ""}`}
+                  data-applied={applyStates[proposalKey(proposal, index)]?.status === "applied" ? "true" : undefined}
                   onClick={() => setSelectedProposalIndex(index)}
                 >
                   <div className="proposalTopRow">

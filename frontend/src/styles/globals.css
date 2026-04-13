@@ -1109,3 +1109,8 @@ body {
     scroll-behavior: auto !important;
   }
 }
+
+.detailSection pre { max-height: 300px; overflow: auto; }
+.proposalList { max-height: 360px; overflow-y: auto; }
+.resultPanelBody { max-height: 400px; overflow: auto; }
+.proposalSelectButton[data-applied="true"] { opacity: 0.55; pointer-events: none; }

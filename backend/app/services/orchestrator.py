@@ -185,6 +185,7 @@ class Orchestrator:
                 event_type=DomainEventType.RUN_FAILED,
                 payload={"status": RunStatus.FAILED.value, "error": error},
             )
+            self._executor.clear_run(run_id)
             return OrchestrationResult(
                 run_id=run_id,
                 root_node_id=root_node_id,
@@ -217,6 +218,7 @@ class Orchestrator:
                 event_type=DomainEventType.RUN_FAILED,
                 payload={"status": RunStatus.FAILED.value, "error": node_result.error},
             )
+            self._executor.clear_run(run_id)
             return OrchestrationResult(
                 run_id=run_id,
                 root_node_id=root_node_id,
@@ -234,6 +236,7 @@ class Orchestrator:
                 event_type=DomainEventType.RUN_COMPLETED,
                 payload={"status": RunStatus.COMPLETED.value},
             )
+            self._executor.clear_run(run_id)
             return OrchestrationResult(
                 run_id=run_id,
                 root_node_id=root_node_id,

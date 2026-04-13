@@ -36,7 +36,9 @@ describe("RunInput", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start Run" }));
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
-    expect(onSubmit).toHaveBeenCalledWith("Create a tiny API", "sql_developer");
+    expect(onSubmit).toHaveBeenCalledWith("Create a tiny API", "sql_developer", {
+      checker: { onCheckFail: "pause" },
+    });
   });
 
   it("shows a fallback option when no personas are available", () => {

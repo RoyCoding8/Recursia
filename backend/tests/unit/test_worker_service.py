@@ -222,7 +222,7 @@ def test_worker_passes_prior_context_to_subsequent_steps() -> None:
     )
 
     step2_user_msg = llm.calls[1].messages[1].content
-    assert "Prior step results" in step2_user_msg
+    assert "Prior progress" in step2_user_msg
     assert "users" in step2_user_msg  # step 1 output carried forward
 
 
