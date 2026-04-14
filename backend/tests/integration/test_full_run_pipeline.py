@@ -114,7 +114,7 @@ class _ScenarioDivider:
             ),
         }
 
-    def divide(self, objective: str, depth: int = 0) -> DividerServiceResult:
+    def divide(self, objective: str, depth: int = 0, **kwargs) -> DividerServiceResult:
         _ = depth
         return self._map[objective]
 
@@ -147,6 +147,7 @@ class _Worker:
         depth: int,
         persona_id: str | None,
         work_plan: list[dict[str, object]],
+        **kwargs,
     ) -> WorkExecutionResult:
         return WorkExecutionResult.completed(
             {

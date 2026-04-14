@@ -1001,6 +1001,41 @@ body {
   outline-offset: 2px;
 }
 
+.nodeContextMenu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-panel);
+  padding: 4px;
+  min-width: 160px;
+}
+
+.nodeContextMenu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--danger);
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-align: left;
+}
+
+.nodeContextMenu button:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.nodeContextMenu button:disabled {
+  color: var(--text-dim);
+  cursor: not-allowed;
+}
+
 .react-flow__edge-path {
   stroke: color-mix(in srgb, var(--border-strong) 85%, transparent);
 }
@@ -1109,3 +1144,8 @@ body {
     scroll-behavior: auto !important;
   }
 }
+
+.detailSection pre { max-height: 300px; overflow: auto; }
+.proposalList { max-height: 360px; overflow-y: auto; }
+.resultPanelBody { max-height: 400px; overflow: auto; }
+.proposalSelectButton[data-applied="true"] { opacity: 0.55; pointer-events: none; }

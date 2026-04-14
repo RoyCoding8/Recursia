@@ -191,6 +191,49 @@ class InMemoryRunStateRepository(RunStateRepository):
         _ = self.get_node(node_id)
         return list(self._interventions[node_id])
 
+    def delete_node(self, run_id: str, node_id: str) -> None:
+        """Delete a single node and its associated attempts/interventions."""
+        if run_id not in self._runs:
+            raise StateNotFoundError(f"run not found: {run_id}")
+        node = self._nodes.pop(node_id, None)
+        if node is None:
+            raise StateNotFoundError(f"node not found: {node_id}")
+        self._attempts.pop(node_id, None)
+        self._interventions.pop(node_id, None)
+        self._run_nodes[run_id] = [
+            nid for nid in self._run_nodes[run_id] if nid != node_id
+        ]
+
+    def delete_children_of(self, run_id: str, parent_node_id: str) -> int:
+        """Recursively delete all descendant nodes of *parent_node_id*."""
+        if run_id not in self._runs:
+            raise StateNotFoundError(f"run not found: {run_id}")
+
+        # BFS to collect the full subtree rooted at parent_node_id (exclusive)
+        to_visit: list[str] = [parent_node_id]
+        descendant_ids: list[str] = []
+        while to_visit:
+            current = to_visit.pop()
+            for nid in list(self._run_nodes.get(run_id, [])):
+                node = self._nodes.get(nid)
+                if node is not None and node.parent_id == current:
+                    descendant_ids.append(nid)
+                    to_visit.append(nid)
+
+        # Remove descendants from all internal stores
+        for nid in descendant_ids:
+            self._nodes.pop(nid, None)
+            self._attempts.pop(nid, None)
+            self._interventions.pop(nid, None)
+
+        if descendant_ids:
+            removed = set(descendant_ids)
+            self._run_nodes[run_id] = [
+                nid for nid in self._run_nodes[run_id] if nid not in removed
+            ]
+
+        return len(descendant_ids)
+
     def append_event(self, event: DomainEvent) -> DomainEvent:
         if event.run_id not in self._runs:
             raise StateNotFoundError(f"run not found for event: {event.run_id}")

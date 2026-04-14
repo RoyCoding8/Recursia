@@ -98,6 +98,13 @@ export class ApiClient {
     return mapInterventionResponse(body);
   }
 
+  async deleteNode(runId: string, nodeId: string): Promise<{ deleted: string; childrenRemoved: number }> {
+    return this.request(
+      `/api/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeId)}`,
+      { method: "DELETE" },
+    );
+  }
+
   async retryNode(runId: string, nodeId: string, note?: string): Promise<InterventionResponse> {
     return this.intervene(runId, nodeId, { action: "retry", note });
   }
@@ -166,11 +173,30 @@ function mapCreateRunResponse(body: unknown): CreateRunResponse {
 }
 
 function mapCreateRunRequest(payload: CreateRunRequest): Record<string, unknown> {
-  return {
+  const result: Record<string, unknown> = {
     objective: payload.objective,
-    config: payload.config,
     base_persona_id: payload.basePersonaId,
   };
+
+  if (payload.config) {
+    const config: Record<string, unknown> = {};
+    if (payload.config.checker) {
+      const checker: Record<string, unknown> = {};
+      if (payload.config.checker.enabled !== undefined) checker.enabled = payload.config.checker.enabled;
+      if (payload.config.checker.nodeLevel !== undefined) checker.node_level = payload.config.checker.nodeLevel;
+      if (payload.config.checker.mergeLevel !== undefined) checker.merge_level = payload.config.checker.mergeLevel;
+      if (payload.config.checker.maxRetriesPerNode !== undefined) checker.max_retries_per_node = payload.config.checker.maxRetriesPerNode;
+      if (payload.config.checker.onCheckFail !== undefined) checker.on_check_fail = payload.config.checker.onCheckFail;
+      config.checker = checker;
+    }
+    if (payload.config.maxDepth !== undefined) config.max_depth = payload.config.maxDepth;
+    if (payload.config.maxChildrenPerNode !== undefined) config.max_children_per_node = payload.config.maxChildrenPerNode;
+    if (payload.config.stream) config.stream = payload.config.stream;
+    
+    result.config = config;
+  }
+
+  return result;
 }
 
 function mapGetRunResponse(body: unknown): GetRunResponse {

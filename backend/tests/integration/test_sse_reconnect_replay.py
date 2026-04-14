@@ -20,7 +20,7 @@ from main import app
 
 
 class _BaseCaseDivider:
-    def divide(self, objective: str, depth: int = 0) -> DividerServiceResult:
+    def divide(self, objective: str, depth: int = 0, **kwargs) -> DividerServiceResult:
         return DividerServiceResult(
             decision=DividerDecision.BASE_CASE,
             base_case=BaseCaseWorkPlan(

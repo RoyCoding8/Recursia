@@ -140,6 +140,10 @@ class RunStore {
         };
         const current = this.state.nodesById[event.nodeId];
         if (current && payload.status) {
+          const metadata = this.buildMetadata(current.metadata, payload.status === "running", {
+            ...(payload.reason ? { lastReason: payload.reason } : {}),
+            ...(payload.errorSource ? { errorSource: payload.errorSource } : {}),
+          });
           this.upsertNode({
             ...current,
             status: payload.status,
@@ -150,11 +154,7 @@ class RunStore {
               typeof payload.checkerFailureCount === "number"
                 ? payload.checkerFailureCount
                 : current.checkerFailureCount,
-            metadata: {
-              ...(current.metadata ?? {}),
-              ...(payload.reason ? { lastReason: payload.reason } : {}),
-              ...(payload.errorSource ? { errorSource: payload.errorSource } : {}),
-            },
+            metadata,
           });
         }
         break;
@@ -310,6 +310,14 @@ class RunStore {
         break;
       }
 
+      case "node.subtree_pruned": {
+        const payload = event.payload as { parentNodeId?: string };
+        if (payload.parentNodeId) {
+          this.removeDescendants(payload.parentNodeId);
+        }
+        break;
+      }
+
       case "node.intervention_applied": {
         if (!event.nodeId) break;
         const current = this.state.nodesById[event.nodeId];
@@ -321,17 +329,19 @@ class RunStore {
             nodeStatus?: string;
           };
 
+          const newStatus = normalizeNodeStatus(payload.nodeStatus, "running");
+          const merged = this.mergeInterventionAudit(current.metadata, {
+            action: payload.action ?? "unknown",
+            note: payload.note,
+            justification: payload.justification,
+            nodeStatus: payload.nodeStatus,
+            at: event.ts,
+            phase: "confirmed",
+          });
           this.upsertNode({
             ...current,
-            status: normalizeNodeStatus(payload.nodeStatus, "running"),
-            metadata: this.mergeInterventionAudit(current.metadata, {
-              action: payload.action ?? "unknown",
-              note: payload.note,
-              justification: payload.justification,
-              nodeStatus: payload.nodeStatus,
-              at: event.ts,
-              phase: "confirmed",
-            }),
+            status: newStatus,
+            metadata: this.stripWorkProgress(merged, newStatus === "running"),
           });
         }
         break;
@@ -427,6 +437,55 @@ class RunStore {
         [node.nodeId]: node,
       },
     };
+  }
+
+  removeNodeAndDescendants(nodeId: string): void {
+    this.removeDescendants(nodeId);
+    const newNodes = { ...this.state.nodesById };
+    delete newNodes[nodeId];
+    const newEdges = this.state.edges.filter(
+      (e) => e.source !== nodeId && e.target !== nodeId,
+    );
+    this.state = { ...this.state, nodesById: newNodes, edges: newEdges };
+    this.emit();
+  }
+
+  private removeDescendants(parentId: string): void {
+    const toRemove = new Set<string>();
+    const queue = [parentId];
+    while (queue.length > 0) {
+      const current = queue.pop()!;
+      for (const [id, node] of Object.entries(this.state.nodesById)) {
+        if (node.parentNodeId === current && !toRemove.has(id)) {
+          toRemove.add(id);
+          queue.push(id);
+        }
+      }
+    }
+    if (toRemove.size === 0) return;
+    const newNodes = { ...this.state.nodesById };
+    for (const id of toRemove) delete newNodes[id];
+    const newEdges = this.state.edges.filter(
+      (e) => !toRemove.has(e.source) && !toRemove.has(e.target),
+    );
+    this.state = { ...this.state, nodesById: newNodes, edges: newEdges };
+  }
+
+  private buildMetadata(
+    existing: Node["metadata"],
+    clearProgress: boolean,
+    extra: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const meta: Record<string, unknown> = { ...(existing ?? {}), ...extra };
+    if (clearProgress) delete meta.workProgress;
+    return meta;
+  }
+
+  private stripWorkProgress(meta: Record<string, unknown>, clear: boolean): Record<string, unknown> {
+    if (!clear) return meta;
+    const copy = { ...meta };
+    delete copy.workProgress;
+    return copy;
   }
 
   private addEdge(source: string, target: string, relation: EdgeRelation): void {

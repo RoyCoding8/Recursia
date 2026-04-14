@@ -12,6 +12,8 @@ The project is split into a FastAPI backend and a Next.js frontend. The backend 
 - Proposal-based file generation instead of opaque server-side writes
 - Review-and-apply workflow for writing approved files into a selected folder
 - Separate validation feedback for checker verdicts versus real runtime failures
+- Checker self-heal: configurable `pause` (human-in-the-loop) and `auto_retry` (autonomous retry with feedback injection) modes for checker failures
+- Scrollable detail panels and batch apply with visual feedback
 
 ## Repository Layout
 

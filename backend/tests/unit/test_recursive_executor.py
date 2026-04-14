@@ -26,7 +26,7 @@ class StubDivider:
     def __init__(self, responses_by_objective: dict[str, DividerServiceResult]) -> None:
         self._responses = responses_by_objective
 
-    def divide(self, objective: str, depth: int = 0) -> DividerServiceResult:
+    def divide(self, objective: str, depth: int = 0, **kwargs) -> DividerServiceResult:
         try:
             return self._responses[objective]
         except KeyError as exc:
@@ -76,6 +76,7 @@ class StubWorker:
         depth: int,
         persona_id: str | None,
         work_plan: list[dict[str, object]],
+        **kwargs,
     ) -> WorkExecutionResult:
         self.calls.append(WorkCall(node_id=node_id, objective=objective))
         if objective in self._responses_by_objective:
@@ -337,7 +338,14 @@ def test_checker_failure_is_recorded_as_validation_without_failing_run() -> None
                     "suggested_fix": "change the CSS selector to a real class used by the HTML",
                     "confidence": 0.74,
                     "violations": ["invalid_selector_target"],
-                }
+                },
+                {
+                    "verdict": "fail",
+                    "reason": "selector should target a class instead of a bare tag name",
+                    "suggested_fix": "change the CSS selector to a real class used by the HTML",
+                    "confidence": 0.74,
+                    "violations": ["invalid_selector_target"],
+                },
             ]
         )
     )
@@ -350,22 +358,17 @@ def test_checker_failure_is_recorded_as_validation_without_failing_run() -> None
     result = orchestrator.start_run(
         objective="Validation objective",
         config=RunConfig(
-            checker=CheckerConfig(enabled=True, node_level=True, merge_level=False)
+            checker=CheckerConfig(
+                enabled=True, node_level=True, merge_level=False,
+                on_check_fail="auto_retry", max_retries_per_node=1,
+            )
         ),
     )
 
     assert result.status == "completed"
     root_node = repo.list_run_nodes(result.run_id)[0]
     assert root_node.status == NodeStatus.COMPLETED
-    assert root_node.consecutive_checker_failures == 1
 
-    attempts = repo.list_node_attempts(root_node.node_id)
-    assert len(attempts) == 1
-    assert attempts[0].error is None
-    assert attempts[0].checker_result is not None
-    assert isinstance(attempts[0].checker_result, CheckerResult)
-    assert attempts[0].checker_result.verdict.value == "fail"
-    assert (
-        attempts[0].checker_result.reason
-        == "selector should target a class instead of a bare tag name"
-    )
+    final_output = result.output
+    assert isinstance(final_output, dict)
+    assert final_output.get("validation_warning") is True

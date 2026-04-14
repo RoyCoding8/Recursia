@@ -1,10 +1,11 @@
 "use client";
 
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import ReactFlow, {
   Background,
   Controls,
   MarkerType,
+  useNodesState,
   type Edge,
   type Node as FlowNode,
   type NodeMouseHandler,
@@ -13,12 +14,15 @@ import "reactflow/dist/style.css";
 
 import type { GraphEdge, Node } from "@/types/contracts";
 import { inferDecisionFromGraph } from "@/lib/decisionUtils";
+import { apiClient } from "@/lib/api";
 
 interface GraphCanvasProps {
   nodes: Node[];
   edges: GraphEdge[];
   selectedNodeId?: string;
   onSelectNode: (nodeId: string) => void;
+  runId?: string;
+  onDeleteNode?: (nodeId: string) => void;
 }
 
 const statusClassMap: Record<Node["status"], string> = {
@@ -92,44 +96,50 @@ function computeTreeLayout(
   return positions;
 }
 
-export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: GraphCanvasProps) {
-  const flowNodes = useMemo<FlowNode[]>(() => {
+export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode, runId, onDeleteNode }: GraphCanvasProps) {
+  const [flowNodes, setFlowNodes, onNodesChange] = useNodesState([]);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
+
+  useEffect(() => {
     const treePositions = computeTreeLayout(nodes, edges);
 
-    return nodes.map((node) => {
-      const position = treePositions.get(node.nodeId) ?? { x: 0, y: 0 };
-      const decision = inferDecisionFromGraph(node, edges);
-      const isRecursive = decision.kind === "RECURSIVE_CASE";
+    setFlowNodes((prev) => {
+      const existing = new Map(prev.map((n) => [n.id, n.position]));
+      return nodes.map((node) => {
+        const position = existing.get(node.nodeId) ?? treePositions.get(node.nodeId) ?? { x: 0, y: 0 };
+        const decision = inferDecisionFromGraph(node, edges);
+        const isRecursive = decision.kind === "RECURSIVE_CASE";
 
-      return {
-        id: node.nodeId,
-        data: {
-          label: (
-            <div className="rfNodeLabel">
-              <div className="rfNodeTopRow">
-                <strong>{node.personaId ?? "unit"}</strong>
-                <span className={`rfCaseBadge ${isRecursive ? "rfCaseRecursive" : "rfCaseBase"}`}>
-                  {isRecursive ? "Recursive container" : "Base work"}
-                </span>
+        return {
+          id: node.nodeId,
+          data: {
+            label: (
+              <div className="rfNodeLabel">
+                <div className="rfNodeTopRow">
+                  <strong>{node.personaId ?? "unit"}</strong>
+                  <span className={`rfCaseBadge ${isRecursive ? "rfCaseRecursive" : "rfCaseBase"}`}>
+                    {isRecursive ? "Recursive container" : "Base work"}
+                  </span>
+                </div>
+                <p className="rfNodeObjective">{node.objective.slice(0, 120)}</p>
+                <div className="rfNodeMetaRow">
+                  <small className="rfNodeStatus">
+                    <span className="rfNodeStatusDot" aria-hidden="true" />
+                    {node.status.replace("_", " ")}
+                  </small>
+                  <small className="rfNodeId">{node.nodeId.slice(0, 12)}</small>
+                </div>
               </div>
-              <p className="rfNodeObjective">{node.objective.slice(0, 120)}</p>
-              <div className="rfNodeMetaRow">
-                <small className="rfNodeStatus">
-                  <span className="rfNodeStatusDot" aria-hidden="true" />
-                  {node.status.replace("_", " ")}
-                </small>
-                <small className="rfNodeId">{node.nodeId.slice(0, 12)}</small>
-              </div>
-            </div>
-          ),
-        },
-        position,
-        className: ["rfNode", statusClassMap[node.status], selectedNodeId === node.nodeId ? "rfNodeSelected" : ""]
-          .filter(Boolean)
-          .join(" "),
-      };
+            ),
+          },
+          position,
+          className: ["rfNode", statusClassMap[node.status], selectedNodeId === node.nodeId ? "rfNodeSelected" : ""]
+            .filter(Boolean)
+            .join(" "),
+        };
+      });
     });
-  }, [edges, nodes, selectedNodeId]);
+  }, [nodes, edges, selectedNodeId, setFlowNodes]);
 
   const flowEdges = useMemo<Edge[]>(() => {
     return edges.map((edge) => ({
@@ -148,8 +158,43 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
   }, [edges]);
 
   const handleNodeClick: NodeMouseHandler = (_, node) => {
+    setContextMenu(null);
     onSelectNode(node.id);
   };
+
+  const handleNodeContextMenu: NodeMouseHandler = useCallback((event, node) => {
+    event.preventDefault();
+    setContextMenu({ x: event.clientX, y: event.clientY, nodeId: node.id });
+  }, []);
+
+  const handlePaneClick = useCallback(() => {
+    setContextMenu(null);
+  }, []);
+
+  const handleDeleteNode = useCallback(async () => {
+    if (!contextMenu || !runId) return;
+    const nodeId = contextMenu.nodeId;
+    const childCount = edges.filter((e) => e.source === nodeId && e.relation === "child").length;
+    const msg = childCount > 0
+      ? `Delete this node and its ${childCount} direct children (and their descendants)?`
+      : "Delete this node?";
+
+    if (!window.confirm(msg)) {
+      setContextMenu(null);
+      return;
+    }
+
+    try {
+      await apiClient.deleteNode(runId, nodeId);
+      onDeleteNode?.(nodeId);
+    } catch (err) {
+      console.error("Failed to delete node:", err);
+    }
+    setContextMenu(null);
+  }, [contextMenu, runId, nodes, edges, onDeleteNode]);
+
+  const contextMenuNode = contextMenu ? nodes.find((n) => n.nodeId === contextMenu.nodeId) : null;
+  const isRootNode = contextMenuNode ? !contextMenuNode.parentNodeId : false;
 
   return (
     <section className="panel canvasPanel" aria-label="Run graph">
@@ -162,7 +207,10 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
         <ReactFlow
           nodes={flowNodes}
           edges={flowEdges}
+          onNodesChange={onNodesChange}
           onNodeClick={handleNodeClick}
+          onNodeContextMenu={handleNodeContextMenu}
+          onPaneClick={handlePaneClick}
           fitView
           minZoom={0.2}
           maxZoom={1.8}
@@ -175,6 +223,21 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode }: Grap
           <Background gap={16} size={1} />
           <Controls showInteractive={false} />
         </ReactFlow>
+
+        {contextMenu && (
+          <div
+            className="nodeContextMenu"
+            style={{ top: contextMenu.y, left: contextMenu.x }}
+          >
+            <button
+              disabled={isRootNode}
+              onClick={handleDeleteNode}
+              title={isRootNode ? "Cannot delete root node" : "Delete this node and its descendants"}
+            >
+              Delete node
+            </button>
+          </div>
+        )}
       </div>
     </section>
   );

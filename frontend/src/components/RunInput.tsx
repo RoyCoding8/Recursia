@@ -5,7 +5,7 @@ import { FormEvent, useEffect, useState } from "react";
 import type { PersonaSummary } from "@/types/contracts";
 
 interface RunInputProps {
-  onSubmit: (objective: string, basePersonaId?: string) => Promise<void> | void;
+  onSubmit: (objective: string, basePersonaId?: string, config?: { checker?: { onCheckFail?: "pause" | "auto_retry" } }) => Promise<void> | void;
   isSubmitting?: boolean;
   personas?: PersonaSummary[];
   defaultPersonaId?: string;
@@ -15,13 +15,14 @@ interface RunInputProps {
 export function RunInput({
   onSubmit,
   isSubmitting = false,
-  personas = [],
+   personas = [],
   defaultPersonaId,
   personasError,
 }: RunInputProps) {
   const [objective, setObjective] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [selectedPersonaId, setSelectedPersonaId] = useState<string>(defaultPersonaId ?? "");
+  const [onCheckFail, setOnCheckFail] = useState<"pause" | "auto_retry">("pause");
 
   useEffect(() => {
     if (defaultPersonaId) {
@@ -39,7 +40,9 @@ export function RunInput({
     }
 
     setError(null);
-    await onSubmit(trimmed, selectedPersonaId || undefined);
+    await onSubmit(trimmed, selectedPersonaId || undefined, {
+      checker: { onCheckFail: onCheckFail },
+    });
   };
 
   return (
@@ -92,6 +95,20 @@ export function RunInput({
           {personasError}
         </p>
       ) : null}
+
+      <label htmlFor="run-on-check-fail" className="label">
+        On checker failure
+      </label>
+      <select
+        id="run-on-check-fail"
+        className="selectInput"
+        value={onCheckFail}
+        onChange={(e) => setOnCheckFail(e.target.value as "pause" | "auto_retry")}
+        disabled={isSubmitting}
+      >
+        <option value="pause">Pause for human (retry or intervene)</option>
+        <option value="auto_retry">Auto-retry (move on if exhausted)</option>
+      </select>
 
       {error ? (
         <p className="messageError" role="alert">

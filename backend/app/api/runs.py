@@ -416,6 +416,38 @@ def get_run_result(
     )
 
 
+@router.delete("/{run_id}/nodes/{node_id}")
+def delete_node(
+    run_id: str,
+    node_id: str,
+    repository: RunStateRepository = Depends(get_run_repository),
+) -> dict[str, object]:
+    """Delete a node and all its descendants from the run graph."""
+    try:
+        node = repository.get_node(node_id)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"node not found: {node_id}",
+        ) from exc
+
+    if node.run_id != run_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"node not found in run: {node_id}",
+        )
+
+    if node.parent_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete root node",
+        )
+
+    count = repository.delete_children_of(run_id, node_id)
+    repository.delete_node(run_id, node_id)
+    return {"deleted": node_id, "childrenRemoved": count}
+
+
 _ELIGIBLE_INTERVENTION_STATUSES = {
     NodeStatus.BLOCKED_HUMAN,
     NodeStatus.FAILED_CHECK,

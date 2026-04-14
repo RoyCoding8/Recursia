@@ -383,6 +383,41 @@ class SQLiteRunStateRepository(RunStateRepository):
         ).fetchall()
         return [self._row_to_intervention(row) for row in rows]
 
+    def delete_node(self, run_id: str, node_id: str) -> None:
+        """Delete a single node. CASCADE handles attempts/interventions."""
+        _ = self.get_run(run_id)
+        cursor = self._conn.execute(
+            "DELETE FROM nodes WHERE node_id = ? AND run_id = ?",
+            (node_id, run_id),
+        )
+        if cursor.rowcount == 0:
+            raise StateNotFoundError(f"node not found: {node_id}")
+        self._conn.commit()
+
+    def delete_children_of(self, run_id: str, parent_node_id: str) -> int:
+        """Recursively delete all descendant nodes of *parent_node_id*.
+
+        Uses a recursive CTE to walk the subtree.  ON DELETE CASCADE on
+        the ``attempts`` and ``interventions`` tables handles child data.
+        ``events.node_id`` becomes NULL (ON DELETE SET NULL).
+        """
+        _ = self.get_run(run_id)
+        cursor = self._conn.execute(
+            """
+            WITH RECURSIVE subtree(node_id) AS (
+                SELECT node_id FROM nodes
+                WHERE parent_id = ? AND run_id = ?
+                UNION ALL
+                SELECT n.node_id FROM nodes n
+                JOIN subtree s ON n.parent_id = s.node_id
+            )
+            DELETE FROM nodes WHERE node_id IN (SELECT node_id FROM subtree)
+            """,
+            (parent_node_id, run_id),
+        )
+        self._conn.commit()
+        return cursor.rowcount
+
     def append_event(self, event: DomainEvent) -> DomainEvent:
         _ = self.get_run(event.run_id)
         ts = event.ts or utc_now()

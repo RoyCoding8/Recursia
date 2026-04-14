@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.domain.models import NodeContext
 from app.schemas.contracts import DividerDecision
 from app.services.divider import BaseCaseWorkPlan, DividerServiceResult
 from app.services.persona_router import PersonaRouteResult
@@ -12,7 +13,8 @@ from app.services.persona_router import PersonaRouteResult
 class DeterministicDivider:
     """Explicit deterministic divider for dev/test fallback wiring."""
 
-    def divide(self, objective: str, depth: int = 0) -> DividerServiceResult:
+    def divide(self, objective: str, depth: int = 0,
+               node_context: NodeContext | None = None) -> DividerServiceResult:
         return DividerServiceResult(
             decision=DividerDecision.BASE_CASE,
             base_case=BaseCaseWorkPlan(
@@ -53,8 +55,8 @@ class DeterministicBaseCaseWorker:
         depth: int,
         persona_id: str | None,
         work_plan: list[dict[str, Any]],
+        node_context: NodeContext | None = None,
     ) -> Any:
-        """Returns WorkExecutionResult.completed(synthesized_output)."""
         from app.services.executor import WorkExecutionResult
 
         synthesized = {

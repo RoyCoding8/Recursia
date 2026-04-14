@@ -107,15 +107,10 @@ class MergerService:
         ]
 
         prompt = (
-            "You are an integration architect merger in a recursive workflow engine. "
-            "Synthesize sibling outputs into one coherent result under declared boundaries. "
-            "Do not concatenate blindly; resolve interface and assumption conflicts explicitly. "
-            "Return JSON with this exact schema: "
-            "{merged_output, conflict_resolutions:[{conflict,chosen_approach,rejected_approach?,rationale}], "
-            "unresolved_conflicts:[string]}. "
-            "If any conflict cannot be safely resolved, add it to unresolved_conflicts. "
+            "Synthesize sibling outputs into one coherent result. "
+            "Resolve interface and assumption conflicts explicitly. "
             f"Parent objective: {request.parent_objective}. "
-            f"Child inputs: {json.dumps(child_inputs, ensure_ascii=False, sort_keys=True)}."
+            f"Child inputs: {json.dumps(child_inputs, ensure_ascii=False, sort_keys=True)[:3000]}."
             f"{repair_hint}"
         )
 
@@ -123,7 +118,9 @@ class MergerService:
             messages=[
                 LLMMessage(
                     role="system",
-                    content="Return strict JSON for merger contract with explicit conflict handling.",
+                    content="Return JSON: {merged_output, conflict_resolutions:"
+                    "[{conflict,chosen_approach,rejected_approach?,rationale}], "
+                    "unresolved_conflicts:[string]}.",
                 ),
                 LLMMessage(role="user", content=prompt),
             ],

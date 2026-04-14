@@ -18,11 +18,12 @@ export type NodeStatus =
 export type EdgeRelation = "child" | "merge_input";
 
 export interface RunConfig {
-  checker: {
-    enabled: boolean;
-    nodeLevel: boolean;
-    mergeLevel: boolean;
-    maxRetriesPerNode: number;
+  checker?: {
+    enabled?: boolean;
+    nodeLevel?: boolean;
+    mergeLevel?: boolean;
+    maxRetriesPerNode?: number;
+    onCheckFail?: "pause" | "auto_retry";
   };
   maxDepth: number;
   maxChildrenPerNode: number;
@@ -139,6 +140,7 @@ export type RunEventType =
   | "merge.completed"
   | "node.blocked_human"
   | "node.intervention_applied"
+  | "node.subtree_pruned"
   | "work.step_started"
   | "work.step_completed"
   | "run.completed"

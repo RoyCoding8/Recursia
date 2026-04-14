@@ -19,7 +19,7 @@ from main import app
 
 
 class _StubDivider:
-    def divide(self, objective: str, depth: int = 0) -> DividerServiceResult:
+    def divide(self, objective: str, depth: int = 0, **kwargs) -> DividerServiceResult:
         return DividerServiceResult(
             decision=DividerDecision.BASE_CASE,
             base_case=BaseCaseWorkPlan(
@@ -314,7 +314,14 @@ def test_run_result_separates_validation_from_terminal_error() -> None:
                     "suggested_fix": "use a class selector that exists in the markup",
                     "confidence": 0.71,
                     "violations": ["css_selector_mismatch"],
-                }
+                },
+                {
+                    "verdict": "fail",
+                    "reason": "selector does not match the generated HTML",
+                    "suggested_fix": "use a class selector that exists in the markup",
+                    "confidence": 0.71,
+                    "violations": ["css_selector_mismatch"],
+                },
             ]
         )
     )
@@ -330,7 +337,8 @@ def test_run_result_separates_validation_from_terminal_error() -> None:
                     "enabled": True,
                     "node_level": True,
                     "merge_level": False,
-                    "max_retries_per_node": 3,
+                    "max_retries_per_node": 1,
+                    "on_check_fail": "auto_retry",
                 }
             },
         },

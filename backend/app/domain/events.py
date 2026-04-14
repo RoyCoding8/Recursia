@@ -24,6 +24,7 @@ class DomainEventType(str, Enum):
     NODE_BLOCKED_HUMAN = "node.blocked_human"
     NODE_INTERVENTION_APPLIED = "node.intervention_applied"
     WORK_STEP_STARTED = "work.step_started"
+    SUBTREE_PRUNED = "node.subtree_pruned"
     WORK_STEP_COMPLETED = "work.step_completed"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"

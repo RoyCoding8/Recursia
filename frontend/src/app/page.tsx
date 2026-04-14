@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { GraphCanvas } from "@/components/GraphCanvas";
 import { NodeDetailsDrawer } from "@/components/NodeDetailsDrawer";
@@ -262,7 +262,7 @@ export default function MissionControlPage() {
     return personas.find((persona) => persona.personaId === "python_developer")?.personaId ?? personas[0]?.personaId;
   }, [personas]);
 
-  const handleStartRun = async (objective: string, basePersonaId?: string) => {
+  const handleStartRun = async (objective: string, basePersonaId?: string, config?: { checker?: { onCheckFail?: "pause" | "auto_retry" } }) => {
     try {
       setSubmitError(null);
       setIsSubmitting(true);
@@ -270,7 +270,7 @@ export default function MissionControlPage() {
       setRunResultError(null);
       setIsRunResultLoading(false);
 
-      const created = await apiClient.createRun({ objective, basePersonaId });
+      const created = await apiClient.createRun({ objective, basePersonaId, config });
       startStream(created.runId);
       const snapshot = await apiClient.getRun(created.runId);
 
@@ -290,6 +290,10 @@ export default function MissionControlPage() {
       setIsSubmitting(false);
     }
   };
+
+  const handleDeleteNode = useCallback((nodeId: string) => {
+    runStore.removeNodeAndDescendants(nodeId);
+  }, []);
 
   return (
     <main className="missionControlPage">
@@ -361,6 +365,8 @@ export default function MissionControlPage() {
           edges={state.edges}
           selectedNodeId={selectedNodeId}
           onSelectNode={setSelectedNodeId}
+          runId={state.run?.runId}
+          onDeleteNode={handleDeleteNode}
         />
 
         <NodeDetailsDrawer

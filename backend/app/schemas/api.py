@@ -15,6 +15,7 @@ class CheckerConfig(BaseModel):
     node_level: bool = True
     merge_level: bool = True
     max_retries_per_node: int = Field(default=3, ge=0)
+    on_check_fail: Literal["pause", "auto_retry"] = "pause"
 
 
 class StreamConfig(BaseModel):

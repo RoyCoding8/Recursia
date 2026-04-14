@@ -117,6 +117,23 @@ class RunStateRepository(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def delete_children_of(self, run_id: str, parent_node_id: str) -> int:
+        """Recursively delete all descendant nodes of *parent_node_id*.
+
+        Removes every node whose ancestor chain includes *parent_node_id*,
+        together with their associated attempts and interventions.
+        Events referencing deleted nodes keep ``node_id = NULL`` (audit trail).
+
+        Returns the count of deleted nodes.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_node(self, run_id: str, node_id: str) -> None:
+        """Delete a single node (not the root) and its associated data."""
+        raise NotImplementedError
+
+    @abstractmethod
     def append_event(self, event: DomainEvent) -> DomainEvent:
         """Append event and assign deterministic per-run sequence."""
         raise NotImplementedError
