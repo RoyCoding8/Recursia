@@ -46,9 +46,15 @@ vi.mock("reactflow", () => {
     );
   };
 
+  const useNodesState = (initial: ReactFlowProps["nodes"]) => {
+    const [nodes, setNodes] = React.useState(initial);
+    return [nodes, setNodes, vi.fn()] as const;
+  };
+
   return {
     __esModule: true,
     default: ReactFlow,
+    useNodesState,
     Background: () => <div data-testid="flow-background" />,
     Controls: () => <div data-testid="flow-controls" />,
     MarkerType: {
