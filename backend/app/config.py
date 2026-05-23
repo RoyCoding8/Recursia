@@ -13,8 +13,6 @@ class ConfigError(ValueError):
 
 @dataclass(slots=True, frozen=True)
 class AppConfig:
-    """Application runtime configuration sourced from environment variables."""
-
     llm_provider: str
     llm_model: str | None
     llm_temperature: float
@@ -29,6 +27,7 @@ class AppConfig:
     aws_secret_access_key: str | None
     bedrock_model_id: str | None
     backend_env_precedence: str
+    database_url: str = "sqlite:///recursia.db"
 
 
 def _default_dotenv_path() -> Path:
@@ -137,6 +136,7 @@ def load_config_from_env() -> AppConfig:
         aws_secret_access_key=_maybe(_env(env, "AWS_SECRET_ACCESS_KEY")),
         bedrock_model_id=_maybe(_env(env, "BEDROCK_MODEL_ID")),
         backend_env_precedence=_env(env, "BACKEND_ENV_PRECEDENCE", default="os_wins"),
+        database_url=_env(env, "DATABASE_URL", default="sqlite:///recursia.db"),
     )
 
 
@@ -166,7 +166,6 @@ def _resolved_model_for_config(config: AppConfig) -> str | None:
 
 
 def build_config_summary(config: AppConfig | None = None) -> dict[str, object]:
-    """Build a non-secret effective runtime config summary."""
     resolved = config or load_config_from_env()
     return {
         "provider": resolved.llm_provider,
@@ -174,6 +173,7 @@ def build_config_summary(config: AppConfig | None = None) -> dict[str, object]:
         "resolved_model_source": model_source_for_config(resolved),
         "fallback_mode": resolved.llm_provider == "stub",
         "env_precedence": resolved.backend_env_precedence,
+        "database_url": resolved.database_url.split("@")[-1] if "@" in resolved.database_url else resolved.database_url,
     }
 
 

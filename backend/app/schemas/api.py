@@ -30,6 +30,9 @@ class RunConfig(BaseModel):
     checker: CheckerConfig = Field(default_factory=CheckerConfig)
     max_depth: int = Field(default=8, ge=1)
     max_children_per_node: int = Field(default=10, ge=1)
+    decomposition_candidates: int = Field(default=3, ge=1, le=10)
+    re_decompose_after: int = Field(default=2, ge=1)
+    complexity_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
     stream: StreamConfig = Field(default_factory=StreamConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
 

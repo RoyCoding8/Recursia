@@ -12,6 +12,7 @@ from app.domain.events import DomainEventType
 from app.domain.models import AttemptState, NodeContext, NodeKind, NodeState, NodeStatus
 from app.schemas.api import CheckerConfig
 from app.schemas.contracts import CheckerResult, DividerDecision, MergeRequest
+from app.services.complexity import ComplexityEstimator
 from app.services.divider import (
     BaseCaseWorkPlan,
     DividerService,
@@ -112,6 +113,7 @@ class RecursiveExecutor:
         worker: BaseCaseWorker | None = None,
         checker: CheckerService | None = None,
         merger: MergerService | None = None,
+        complexity_estimator: ComplexityEstimator | None = None,
         event_emitter: EventEmitter | None = None,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
@@ -121,6 +123,7 @@ class RecursiveExecutor:
         self._worker = worker or DeterministicBaseCaseWorker()
         self._checker = checker
         self._merger = merger
+        self._complexity_estimator = complexity_estimator or ComplexityEstimator()
         self._event_emitter = event_emitter
         self._id_factory = id_factory or _default_id_factory
         self._outputs: dict[str, dict[str, Any]] = {}
@@ -141,7 +144,6 @@ class RecursiveExecutor:
         node = self._repository.get_node(node_id)
         depth_limited = node.depth >= run.config.max_depth
 
-        # Build lineage context if not provided (root node)
         if node_context is None:
             node_context = NodeContext(root_objective=run.objective)
 
@@ -163,6 +165,15 @@ class RecursiveExecutor:
         )
         self._apply_persona(node_id=node_id, route=route)
 
+        # Complexity estimation
+        complexity = self._complexity_estimator.estimate(
+            node.objective, context=node_context, depth=node.depth,
+        )
+        num_candidates = (
+            run.config.decomposition_candidates
+            if complexity.score >= run.config.complexity_threshold else 1
+        )
+
         if depth_limited:
             divide_result = self._forced_base_case_result(
                 node=node, max_depth=run.config.max_depth
@@ -172,6 +183,7 @@ class RecursiveExecutor:
             divide_result = self._divider.divide(
                 objective=node.objective, depth=node.depth,
                 node_context=node_context,
+                complexity=complexity, num_candidates=num_candidates,
             )
 
         if (
@@ -191,23 +203,29 @@ class RecursiveExecutor:
 
         if divide_result.decision == DividerDecision.BASE_CASE:
             return self._execute_base_case(
+                run_config=run.config,
                 node=self._repository.get_node(node_id),
                 divide_result=divide_result,
                 node_context=node_context,
+                complexity=complexity,
             )
 
         return self._execute_recursive_case(
+            run_config=run.config,
             node=self._repository.get_node(node_id),
             divide_result=divide_result,
             node_context=node_context,
+            complexity=complexity,
         )
 
     def _execute_base_case(
         self,
         *,
+        run_config: object,
         node: NodeState,
         divide_result: DividerServiceResult,
         node_context: NodeContext,
+        complexity: object | None = None,
     ) -> NodeExecutionResult:
         if divide_result.base_case is None:
             self._repository.record_node_ended(node.node_id, NodeStatus.ERROR)
@@ -256,6 +274,7 @@ class RecursiveExecutor:
             if checker_outcome is not None and checker_outcome.next_node_status == NodeStatus.FAILED_CHECK:
                 on_fail = node.checker_policy.on_check_fail
                 max_retries = node.checker_policy.max_retries_per_node
+                re_decompose_after = getattr(run_config, 're_decompose_after', 2)
 
                 if on_fail == "pause":
                     self._record_attempt(
@@ -270,10 +289,30 @@ class RecursiveExecutor:
                         error=checker_result.reason if checker_result else "checker failed",
                     )
 
+                consecutive_fails = 0
                 for _retry in range(max_retries):
                     fix = checker_result.suggested_fix if checker_result else ""
                     violations = list(checker_result.violations) if checker_result else []
                     retry_ctx = node_context.with_checker_feedback(fix, violations)
+                    consecutive_fails += 1
+
+                    # Re-decomposition: after N consecutive failures, re-invoke divider
+                    if consecutive_fails >= re_decompose_after and divide_result.base_case is not None:
+                        self._record_attempt(
+                            node=node, output=work.output,
+                            error=f"re-decomposing after {consecutive_fails} failures",
+                            checker_result=checker_result,
+                        )
+                        try:
+                            divide_result = self._divider.divide(
+                                objective=node.objective, depth=node.depth,
+                                node_context=retry_ctx, complexity=complexity,
+                            )
+                            if divide_result.base_case is not None:
+                                consecutive_fails = 0  # reset counter
+                        except Exception:
+                            pass  # keep old divide_result on failure
+
                     self._record_attempt(
                         node=node, output=work.output,
                         error=f"self-heal retry (checker: {checker_result.reason if checker_result else 'failed'})",
@@ -369,9 +408,11 @@ class RecursiveExecutor:
     def _execute_recursive_case(
         self,
         *,
+        run_config: object = None,
         node: NodeState,
         divide_result: DividerServiceResult,
         node_context: NodeContext,
+        complexity: object | None = None,
     ) -> NodeExecutionResult:
         if divide_result.recursive_case is None:
             self._repository.record_node_ended(node.node_id, NodeStatus.ERROR)
@@ -503,17 +544,37 @@ class RecursiveExecutor:
 
         merged = self._merge_children(node=node, merged_outputs=merged_outputs)
 
+        # Merge-level checker with retry loop
+        merge_max_retries = getattr(run_config, 'checker', node.checker_policy).max_retries_per_node if run_config else 1
         checker_outcome = self._evaluate_checker(
-            node=node,
-            scope=CheckerScope.MERGE,
-            output=merged,
+            node=node, scope=CheckerScope.MERGE, output=merged,
         )
         checker_result = checker_outcome.result if checker_outcome else None
+
+        if checker_outcome is not None and checker_outcome.next_node_status == NodeStatus.FAILED_CHECK:
+            for _merge_retry in range(min(merge_max_retries, 2)):
+                fix = checker_result.suggested_fix if checker_result else ""
+                violations = list(checker_result.violations) if checker_result else []
+                retry_ctx = node_context.with_checker_feedback(fix, violations)
+                self._record_attempt(
+                    node=node, output=merged,
+                    error=f"merge-level retry (checker: {checker_result.reason if checker_result else 'failed'})",
+                    checker_result=checker_result,
+                )
+                merged = self._merge_children(node=node, merged_outputs=merged_outputs)
+                checker_outcome = self._evaluate_checker(
+                    node=node, scope=CheckerScope.MERGE, output=merged,
+                )
+                checker_result = checker_outcome.result if checker_outcome else None
+                if checker_outcome is None or checker_outcome.next_node_status == NodeStatus.COMPLETED:
+                    break
+                if checker_outcome.next_node_status == NodeStatus.BLOCKED_HUMAN:
+                    break
+
         if checker_outcome is not None:
             if checker_outcome.next_node_status == NodeStatus.BLOCKED_HUMAN:
                 self._record_attempt(
-                    node=node,
-                    output=merged,
+                    node=node, output=merged,
                     error=checker_outcome.result.reason if checker_outcome.result else "checker blocked human",
                     checker_result=checker_result,
                 )
@@ -534,9 +595,7 @@ class RecursiveExecutor:
             ttft_ms=ended_node.ttft_ms,
         )
         self._record_attempt(
-            node=node,
-            output=merged,
-            error=None,
+            node=node, output=merged, error=None,
             checker_result=checker_result,
         )
         return NodeExecutionResult(
@@ -653,26 +712,12 @@ class RecursiveExecutor:
         }
 
     def _emit_merge_events(self, *, node: NodeState, merge_result: object) -> None:
-        if self._event_emitter is None:
-            return
-        events = getattr(merge_result, "events", ())
-        for event in events:
-            event_type = getattr(event, "event_type", "")
-            payload = getattr(event, "payload", {})
-            if event_type == "merge.started":
-                self._event_emitter(
-                    node.run_id,
-                    node.node_id,
-                    DomainEventType.MERGE_STARTED,
-                    dict(payload),
-                )
-            elif event_type == "merge.completed":
-                self._event_emitter(
-                    node.run_id,
-                    node.node_id,
-                    DomainEventType.MERGE_COMPLETED,
-                    dict(payload),
-                )
+        _type_map = {"merge.started": DomainEventType.MERGE_STARTED,
+                     "merge.completed": DomainEventType.MERGE_COMPLETED}
+        for event in getattr(merge_result, "events", ()):
+            evt = _type_map.get(getattr(event, "event_type", ""))
+            if evt:
+                self._emit(node.run_id, node.node_id, evt, dict(getattr(event, "payload", {})))
 
     def _evaluate_checker(
         self,
@@ -739,136 +784,69 @@ class RecursiveExecutor:
         return outcome
 
     def _emit_checker_started(self, *, node: NodeState, scope: CheckerScope) -> None:
-        if self._event_emitter is None:
-            return
-        self._event_emitter(
-            node.run_id,
-            node.node_id,
-            DomainEventType.CHECKER_STARTED,
-            {"scope": scope.value, "attempt": node.attempt_count},
-        )
+        self._emit(node.run_id, node.node_id, DomainEventType.CHECKER_STARTED,
+                   {"scope": scope.value, "attempt": node.attempt_count})
 
-    def _emit_checker_completed(
-        self,
-        *,
-        node: NodeState,
-        scope: CheckerScope,
-        verdict: str,
-        reason: str,
-        suggested_fix: str,
-        confidence: float,
-        violations: list[str],
-        consecutive_failures: int,
-    ) -> None:
-        if self._event_emitter is None:
-            return
-        self._event_emitter(
-            node.run_id,
-            node.node_id,
-            DomainEventType.CHECKER_COMPLETED,
-            {
-                "scope": scope.value,
-                "verdict": verdict,
-                "reason": reason,
-                "suggestedFix": suggested_fix,
-                "confidence": confidence,
-                "violations": violations,
-                "consecutiveFailures": consecutive_failures,
-            },
-        )
+    def _emit_checker_completed(self, *, node: NodeState, scope: CheckerScope,
+                                verdict: str, reason: str, suggested_fix: str,
+                                confidence: float, violations: list[str],
+                                consecutive_failures: int) -> None:
+        self._emit(node.run_id, node.node_id, DomainEventType.CHECKER_COMPLETED, {
+            "scope": scope.value, "verdict": verdict, "reason": reason,
+            "suggestedFix": suggested_fix, "confidence": confidence,
+            "violations": violations, "consecutiveFailures": consecutive_failures,
+        })
 
     def _mark_blocked_human(self, node_id: str) -> None:
         node = self._repository.get_node(node_id)
         if node.status == NodeStatus.BLOCKED_HUMAN:
             return
-        if node.status == NodeStatus.RUNNING:
-            self._repository.update_node_status(node_id, NodeStatus.WAITING_CHECK)
-            self._repository.update_node_status(node_id, NodeStatus.FAILED_CHECK)
-            ended = self._repository.record_node_ended(
-                node_id, NodeStatus.BLOCKED_HUMAN
-            )
+        # Walk the required state transitions to reach BLOCKED_HUMAN
+        transitions = {
+            NodeStatus.RUNNING: [NodeStatus.WAITING_CHECK, NodeStatus.FAILED_CHECK],
+            NodeStatus.WAITING_CHECK: [NodeStatus.FAILED_CHECK],
+            NodeStatus.FAILED_CHECK: [],
+        }
+        if node.status in transitions:
+            for intermediate in transitions[node.status]:
+                self._repository.update_node_status(node_id, intermediate)
+            ended = self._repository.record_node_ended(node_id, NodeStatus.BLOCKED_HUMAN)
             self._emit_node_status(
-                node_id=node_id,
-                status=ended.status,
+                node_id=node_id, status=ended.status,
                 reason="checker_failed_consecutive_threshold",
-                duration_ms=ended.duration_ms,
-                ttft_ms=ended.ttft_ms,
+                duration_ms=ended.duration_ms, ttft_ms=ended.ttft_ms,
             )
             self._emit_node_blocked(node_id=node_id)
-            return
-        if node.status == NodeStatus.WAITING_CHECK:
-            self._repository.update_node_status(node_id, NodeStatus.FAILED_CHECK)
-            ended = self._repository.record_node_ended(
-                node_id, NodeStatus.BLOCKED_HUMAN
-            )
+        else:
+            ended = self._repository.record_node_ended(node_id, NodeStatus.ERROR)
             self._emit_node_status(
-                node_id=node_id,
-                status=ended.status,
-                reason="checker_failed_consecutive_threshold",
-                duration_ms=ended.duration_ms,
-                ttft_ms=ended.ttft_ms,
+                node_id=node_id, status=ended.status,
+                reason="invalid_transition_to_blocked_human",
+                duration_ms=ended.duration_ms, ttft_ms=ended.ttft_ms,
             )
-            self._emit_node_blocked(node_id=node_id)
-            return
-        if node.status == NodeStatus.FAILED_CHECK:
-            ended = self._repository.record_node_ended(
-                node_id, NodeStatus.BLOCKED_HUMAN
-            )
-            self._emit_node_status(
-                node_id=node_id,
-                status=ended.status,
-                reason="checker_failed_consecutive_threshold",
-                duration_ms=ended.duration_ms,
-                ttft_ms=ended.ttft_ms,
-            )
-            self._emit_node_blocked(node_id=node_id)
-            return
-        ended = self._repository.record_node_ended(node_id, NodeStatus.ERROR)
-        self._emit_node_status(
-            node_id=node_id,
-            status=ended.status,
-            reason="invalid_transition_to_blocked_human",
-            duration_ms=ended.duration_ms,
-            ttft_ms=ended.ttft_ms,
-        )
+
+    def _emit(self, run_id: str, node_id: str, event_type: DomainEventType,
+             payload: dict[str, object]) -> None:
+        if self._event_emitter is not None:
+            self._event_emitter(run_id, node_id, event_type, payload)
 
     def _emit_node_created(self, node: NodeState) -> None:
-        if self._event_emitter is None:
-            return
-        self._event_emitter(
-            node.run_id,
-            node.node_id,
-            DomainEventType.NODE_CREATED,
-            {
-                "node": {
-                    "nodeId": node.node_id,
-                    "runId": node.run_id,
-                    "parentNodeId": node.parent_id,
-                    "objective": node.objective,
-                    "status": self._event_node_status(node.status),
-                    "personaId": node.persona_id,
-                    "depth": node.depth,
-                    "nodeKind": node.node_kind.value,
-                    "ttftMs": node.ttft_ms,
-                    "durationMs": node.duration_ms,
-                    "checkerFailureCount": node.consecutive_checker_failures,
-                },
-                "parentNodeId": node.parent_id,
-                "relation": "child",
+        self._emit(node.run_id, node.node_id, DomainEventType.NODE_CREATED, {
+            "node": {
+                "nodeId": node.node_id, "runId": node.run_id,
+                "parentNodeId": node.parent_id, "objective": node.objective,
+                "status": self._event_node_status(node.status),
+                "personaId": node.persona_id, "depth": node.depth,
+                "nodeKind": node.node_kind.value, "ttftMs": node.ttft_ms,
+                "durationMs": node.duration_ms,
+                "checkerFailureCount": node.consecutive_checker_failures,
             },
-        )
+            "parentNodeId": node.parent_id, "relation": "child",
+        })
 
-    def _emit_node_status(
-        self,
-        *,
-        node_id: str,
-        status: NodeStatus,
-        reason: str | None = None,
-        duration_ms: int | None = None,
-        ttft_ms: int | None = None,
-    ) -> None:
-        if self._event_emitter is None:
-            return
+    def _emit_node_status(self, *, node_id: str, status: NodeStatus,
+                          reason: str | None = None, duration_ms: int | None = None,
+                          ttft_ms: int | None = None) -> None:
         node = self._repository.get_node(node_id)
         payload: dict[str, object] = {
             "status": self._event_node_status(status),
@@ -879,55 +857,24 @@ class RecursiveExecutor:
         }
         if reason:
             payload["reason"] = reason
-            # Classify error source for the frontend
             payload["errorSource"] = self._classify_error_source(reason)
-        self._event_emitter(
-            node.run_id,
-            node.node_id,
-            DomainEventType.NODE_STATUS_CHANGED,
-            payload,
-        )
+        self._emit(node.run_id, node.node_id, DomainEventType.NODE_STATUS_CHANGED, payload)
 
     def _emit_node_ttft(self, node: NodeState) -> None:
-        if self._event_emitter is None or node.ttft_ms is None:
-            return
-        self._event_emitter(
-            node.run_id,
-            node.node_id,
-            DomainEventType.NODE_TTFT_RECORDED,
-            {
-                "ttft_ms": node.ttft_ms,
-                "ttftMs": node.ttft_ms,
-            },
-        )
+        if node.ttft_ms is not None:
+            self._emit(node.run_id, node.node_id, DomainEventType.NODE_TTFT_RECORDED,
+                       {"ttft_ms": node.ttft_ms, "ttftMs": node.ttft_ms})
 
     def _emit_node_blocked(self, *, node_id: str) -> None:
-        if self._event_emitter is None:
-            return
         node = self._repository.get_node(node_id)
-        self._event_emitter(
-            node.run_id,
-            node.node_id,
-            DomainEventType.NODE_BLOCKED_HUMAN,
-            {
-                "reason": "checker_failed_consecutive_threshold",
-                "retryCount": node.consecutive_checker_failures,
-            },
-        )
+        self._emit(node.run_id, node.node_id, DomainEventType.NODE_BLOCKED_HUMAN,
+                   {"reason": "checker_failed_consecutive_threshold",
+                    "retryCount": node.consecutive_checker_failures})
 
     def _emit_subtree_pruned(self, *, node: NodeState, pruned_count: int) -> None:
-        if self._event_emitter is None:
-            return
-        self._event_emitter(
-            node.run_id,
-            node.node_id,
-            DomainEventType.SUBTREE_PRUNED,
-            {
-                "parentNodeId": node.node_id,
-                "prunedCount": pruned_count,
-                "reason": "retry_recursive_case",
-            },
-        )
+        self._emit(node.run_id, node.node_id, DomainEventType.SUBTREE_PRUNED,
+                   {"parentNodeId": node.node_id, "prunedCount": pruned_count,
+                    "reason": "retry_recursive_case"})
 
     @staticmethod
     def _classify_error_source(reason: str) -> str:
@@ -984,27 +931,13 @@ class RecursiveExecutor:
             attempts_used=0,
         )
 
-    def _emit_depth_limit_reached(
-        self,
-        *,
-        node: NodeState,
-        max_depth: int,
-        reason: str = "max_depth_reached",
-    ) -> None:
-        if self._event_emitter is None:
-            return
-        self._event_emitter(
-            node.run_id,
-            node.node_id,
-            DomainEventType.NODE_TOKEN,
-            {
-                "token": (
-                    f"Depth guardrail active: forcing base-case at depth={node.depth} "
-                    f"(max_depth={max_depth}, reason={reason})."
-                ),
-                "stream": "stderr",
-            },
-        )
+    def _emit_depth_limit_reached(self, *, node: NodeState, max_depth: int,
+                                   reason: str = "max_depth_reached") -> None:
+        self._emit(node.run_id, node.node_id, DomainEventType.NODE_TOKEN, {
+            "token": f"Depth guardrail active: forcing base-case at depth={node.depth} "
+                     f"(max_depth={max_depth}, reason={reason}).",
+            "stream": "stderr",
+        })
 
     def _record_attempt(
         self,

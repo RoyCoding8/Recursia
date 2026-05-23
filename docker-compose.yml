@@ -1,0 +1,42 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: recursia
+      POSTGRES_USER: recursia
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-recursia_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recursia"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql://recursia:${POSTGRES_PASSWORD:-recursia_dev}@db:5432/recursia
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./personas:/app/personas
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: http://backend:8000
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:

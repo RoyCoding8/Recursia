@@ -329,7 +329,7 @@ def test_worker_metadata_includes_service_worker() -> None:
     assert llm.calls[0].metadata["step"] == "1"
 
 
-def test_worker_returns_file_proposals_instead_of_writing_files(tmp_path) -> None:
+def test_worker_returns_file_proposals_instead_of_writing_files() -> None:
     """Files emitted by the LLM should become proposals, not direct writes."""
     llm = StubLLMClient(
         responses=[
@@ -348,7 +348,6 @@ def test_worker_returns_file_proposals_instead_of_writing_files(tmp_path) -> Non
     worker = LLMBaseCaseWorker(
         llm_client=llm,
         persona_registry=registry,
-        workspace_root=tmp_path,
     )
 
     result = worker.execute(
@@ -373,4 +372,3 @@ def test_worker_returns_file_proposals_instead_of_writing_files(tmp_path) -> Non
 
     step_proposals = result.output["step_results"][0]["file_proposals"]
     assert len(step_proposals) == 2
-    assert not (tmp_path / "run_1" / "src" / "main.py").exists()

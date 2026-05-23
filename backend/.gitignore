@@ -8,3 +8,13 @@ wheels/
 
 # Virtual environments
 .venv
+.env
+
+# Application data
+data/
+*.sqlite3
+
+# Testing and linting
+.pytest_cache/
+.ruff_cache/
+.coverage

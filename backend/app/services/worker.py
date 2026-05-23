@@ -1,8 +1,8 @@
 """LLM-powered base-case worker: executes multi-step work plans via persona-aware LLM calls."""
-
 from __future__ import annotations
 
 import json
+import importlib.util
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,9 +15,6 @@ from app.services.persona_registry import PersonaProfile, PersonaRegistry
 
 EventEmitter = Callable[[str, str, DomainEventType, dict[str, object]], None]
 
-# Default workspace root — each run gets a subfolder
-_DEFAULT_WORKSPACE_ROOT = Path(__file__).resolve().parents[3] / "workspace"
-
 
 class WorkerSchemaError(RuntimeError):
     """Raised when work step output cannot be parsed as JSON."""
@@ -25,8 +22,6 @@ class WorkerSchemaError(RuntimeError):
 
 @dataclass(slots=True, frozen=True)
 class StepResult:
-    """Result of executing one work-plan step via LLM."""
-
     step_index: int
     description: str
     output: dict[str, Any] | list[Any] | str | int | float | bool | None
@@ -35,8 +30,6 @@ class StepResult:
 
 @dataclass(slots=True, frozen=True)
 class FileProposal:
-    """Normalized file proposal emitted by a work step."""
-
     path: str
     content: str
     step_index: int
@@ -44,389 +37,182 @@ class FileProposal:
 
 
 class LLMBaseCaseWorker:
-    """Executes base-case work plans by calling the LLM for each step with persona context.
+    """Executes base-case work plans step-by-step with persona context, hooks, and schema validation."""
 
-    This is the piece that makes the recursive engine actually *do* work.
-    The divider breaks objectives into a work_plan of sequential steps;
-    this worker iterates through those steps, injecting the assigned persona's
-    system prompt and guardrails, and calling the LLM for each step.
-    """
+    def __init__(self, *, llm_client: LLMClient, persona_registry: PersonaRegistry,
+                 temperature: float = 0.2, event_emitter: EventEmitter | None = None) -> None:
+        self._llm = llm_client
+        self._registry = persona_registry
+        self._temp = temperature
+        self._emitter = event_emitter
 
-    def __init__(
-        self,
-        *,
-        llm_client: LLMClient,
-        persona_registry: PersonaRegistry,
-        temperature: float = 0.2,
-        event_emitter: EventEmitter | None = None,
-        workspace_root: Path | None = None,
-    ) -> None:
-        self._llm_client = llm_client
-        self._persona_registry = persona_registry
-        self._temperature = temperature
-        self._event_emitter = event_emitter
-        self._workspace_root = workspace_root or _DEFAULT_WORKSPACE_ROOT
-
-    def execute(
-        self,
-        *,
-        run_id: str,
-        node_id: str,
-        objective: str,
-        depth: int,
-        persona_id: str | None,
-        work_plan: list[dict[str, Any]],
-        node_context: NodeContext | None = None,
-    ) -> Any:
-        """Execute the full work plan step-by-step and return a WorkExecutionResult."""
+    def execute(self, *, run_id: str, node_id: str, objective: str, depth: int,
+                persona_id: str | None, work_plan: list[dict[str, Any]],
+                node_context: NodeContext | None = None) -> Any:
         from app.services.executor import WorkExecutionResult
 
-        workspace_dir = self._workspace_root / run_id
+        profile = self._registry.get_profile(persona_id) if persona_id else None
+        sys_prompt = self._build_system(profile)
+        steps: list[dict[str, Any]] = []
+        ctx: list[str] = []
+        proposals: list[dict[str, Any]] = []
 
-        profile = self._resolve_persona(persona_id)
-        system_prompt = self._build_system_prompt(profile, workspace_dir)
-
-        step_results: list[dict[str, Any]] = []
-        accumulated_context: list[str] = []
-        file_proposals: list[dict[str, Any]] = []
-
-        for index, step in enumerate(work_plan):
-            step_index = step.get("step", index + 1)
-            step_description = step.get("description", f"Step {step_index}")
-
-            self._emit_step_started(
-                run_id=run_id,
-                node_id=node_id,
-                step_index=step_index,
-                description=step_description,
-                total_steps=len(work_plan),
-            )
+        for i, step in enumerate(work_plan):
+            si = step.get("step", i + 1)
+            desc = step.get("description", f"Step {si}")
+            total = len(work_plan)
+            self._emit(run_id, node_id, DomainEventType.WORK_STEP_STARTED,
+                       {"stepIndex": si, "description": desc, "totalSteps": total})
 
             try:
-                step_output = self._execute_step(
-                    system_prompt=system_prompt,
-                    objective=objective,
-                    step_description=step_description,
-                    step_index=step_index,
-                    total_steps=len(work_plan),
-                    depth=depth,
-                    prior_context=self._build_sliding_context(
-                        accumulated_context, objective),
-                    profile=profile,
-                    workspace_dir=workspace_dir,
-                    node_context=node_context,
-                )
-            except Exception as first_error:
-                # Attempt self-heal: retry with error context
-                step_output = self._attempt_self_heal(
-                    system_prompt=system_prompt,
-                    objective=objective,
-                    step_description=step_description,
-                    step_index=step_index,
-                    total_steps=len(work_plan),
-                    depth=depth,
-                    prior_context=accumulated_context,
-                    profile=profile,
-                    workspace_dir=workspace_dir,
-                    original_error=str(first_error),
-                )
-                if step_output is None:
-                    self._emit_step_completed(
-                        run_id=run_id,
-                        node_id=node_id,
-                        step_index=step_index,
-                        description=step_description,
-                        total_steps=len(work_plan),
-                        error=str(first_error),
-                    )
-                    return WorkExecutionResult.failed(
-                        f"step {step_index} failed (self-heal also failed): {first_error}"
-                    )
+                out = self._call_step(sys_prompt, objective, desc, si, total, depth,
+                                      _sliding_context(ctx, objective), profile, node_context)
+            except Exception as err:
+                out = self._self_heal(sys_prompt, objective, desc, si, total, depth, ctx, profile, str(err))
+                if out is None:
+                    self._emit(run_id, node_id, DomainEventType.WORK_STEP_COMPLETED,
+                               {"stepIndex": si, "description": desc, "totalSteps": total, "success": False, "error": str(err)})
+                    return WorkExecutionResult.failed(f"step {si} failed (self-heal also failed): {err}")
 
-            # Normalize any proposed files without performing final writes yet.
-            proposals_from_step = self._extract_file_proposals(
-                step_output, workspace_dir, node_id, step_index
-            )
-            file_proposals.extend(
-                [
-                    {
-                        "path": proposal["path"],
-                        "content": proposal["content"],
-                        "step_index": proposal["step_index"],
-                        "node_id": proposal["node_id"],
-                    }
-                    for proposal in proposals_from_step
-                ]
-            )
+            sp = _extract_file_proposals(out, node_id, si)
+            proposals.extend(sp)
+            ctx.append(f"Step {si} ({desc}): {json.dumps(out, ensure_ascii=False, default=str)[:300]}")
+            steps.append({"step": si, "description": desc, "output": out, "file_proposals": sp})
+            self._emit(run_id, node_id, DomainEventType.WORK_STEP_COMPLETED,
+                       {"stepIndex": si, "description": desc, "totalSteps": total, "success": True})
 
-            accumulated_context.append(
-                f"Step {step_index} ({step_description}): "
-                f"{json.dumps(step_output, ensure_ascii=False, default=str)[:300]}"
-            )
+        return WorkExecutionResult.completed({
+            "objective": objective, "persona_id": persona_id,
+            "steps_completed": len(steps), "step_results": steps, "file_proposals": proposals,
+        })
 
-            step_results.append(
-                {
-                    "step": step_index,
-                    "description": step_description,
-                    "output": step_output,
-                    "file_proposals": proposals_from_step,
-                }
-            )
+    # ---- prompt building ----
 
-            self._emit_step_completed(
-                run_id=run_id,
-                node_id=node_id,
-                step_index=step_index,
-                description=step_description,
-                total_steps=len(work_plan),
-                error=None,
-            )
-
-        synthesized = {
-            "objective": objective,
-            "persona_id": persona_id,
-            "steps_completed": len(step_results),
-            "step_results": step_results,
-            "workspace": str(workspace_dir),
-            "file_proposals": file_proposals,
-        }
-
-        return WorkExecutionResult.completed(synthesized)
-
-    def _resolve_persona(self, persona_id: str | None) -> PersonaProfile | None:
-        if not persona_id:
-            return None
-        return self._persona_registry.get_profile(persona_id)
-
-    def _build_system_prompt(
-        self, profile: PersonaProfile | None, workspace_dir: Path | None = None
-    ) -> str:
-        workspace_instruction = ""
-        if workspace_dir:
-            workspace_instruction = (
-                f"\n\nUse workspace root reference: {workspace_dir}\n"
-                "When your step produces code, configs, or documents, include a 'files' array "
-                "in your JSON response. Each entry: {\"path\": \"relative/path.ext\", \"content\": \"file content\"}. "
-                "Paths are relative to the workspace root. These are proposed files for review, not final writes. Example:\n"
-                '{"reasoning": "...", "output": "...", "files": [{"path": "src/main.py", "content": "print(\'hello\')"}]}'
-            )
-
+    def _build_system(self, profile: PersonaProfile | None) -> str:
         if profile is None:
-            return (
-                "You are a skilled execution agent in a recursive workflow engine. "
-                "Complete the assigned step precisely and return structured JSON output."
-                f"{workspace_instruction}"
-            )
-
-        guardrail_block = ""
+            return ("You are a skilled execution agent in a recursive workflow engine. "
+                    "Complete the assigned step precisely and return structured JSON output.\n\n"
+                    "When producing code/files, include a 'files' array: "
+                    '[{"path": "relative/path.ext", "content": "..."}].\n'
+                    'Return JSON with "reasoning" and "output" fields.')
+        parts = [profile.system_prompt]
         if profile.guardrails:
-            guardrail_lines = "\n".join(f"- {g}" for g in profile.guardrails)
-            guardrail_block = f"\n\nGuardrails you MUST follow:\n{guardrail_lines}"
-
-        tool_block = ""
+            parts.append("\n\nGuardrails you MUST follow:\n" + "\n".join(f"- {g}" for g in profile.guardrails))
         if profile.tools:
-            tool_lines = ", ".join(profile.tools)
-            tool_block = f"\n\nAvailable tools: {tool_lines}"
+            parts.append(f"\n\nAvailable tools: {', '.join(profile.tools)}")
+        if profile.examples:
+            parts.append(_examples_block(profile.examples))
+        parts.append("\n\nReturn your response as structured JSON.")
+        return "".join(parts)
 
-        return (
-            f"{profile.system_prompt}"
-            f"{guardrail_block}"
-            f"{tool_block}"
-            f"{workspace_instruction}"
-            "\n\nReturn your response as structured JSON."
-        )
+    # ---- LLM call ----
 
-    def _extract_file_proposals(
-        self,
-        step_output: Any,
-        workspace_dir: Path,
-        node_id: str,
-        step_index: int,
-    ) -> list[dict[str, Any]]:
-        """Extract normalized file proposals from LLM output without writing them."""
-        if not isinstance(step_output, dict):
-            return []
+    def _call_step(self, sys_prompt: str, objective: str, desc: str, si: int, total: int,
+                   depth: int, prior: str, profile: PersonaProfile | None,
+                   node_ctx: NodeContext | None = None) -> Any:
+        lineage = f"\n\n{node_ctx.to_prompt_block()}" if node_ctx else ""
+        ctx_block = f"\n\nPrior progress:\n{prior}" if prior else ""
+        name = profile.name if profile else "General Agent"
+        user_prompt = (f"You are acting as: {name}\nOverall objective: {objective}\n"
+                       f"Current step ({si}/{total}): {desc}\nTree depth: {depth}"
+                       f"{lineage}{ctx_block}\n\nExecute this step. Return JSON with 'reasoning' and 'output' fields.")
+        if profile:
+            user_prompt = _run_hook(profile, "pre", user_prompt)
+        temp = profile.model.temperature if profile and profile.model.temperature is not None else self._temp
+        resp = self._llm.generate_json(LLMGenerateRequest(
+            messages=[LLMMessage(role="system", content=sys_prompt), LLMMessage(role="user", content=user_prompt)],
+            temperature=temp,
+            metadata={"service": "worker", "step": str(si), "total_steps": str(total),
+                      "persona": profile.persona_id if profile else "none"},
+        ))
+        if profile:
+            resp = _run_hook(profile, "post", resp)
+        return resp
 
-        files = step_output.get("files", [])
-        if not isinstance(files, list):
-            return []
-
-        proposals: list[dict[str, Any]] = []
-        for entry in files:
-            if not isinstance(entry, dict):
-                continue
-            rel_path = entry.get("path", "")
-            content = entry.get("content", "")
-            if not rel_path or not isinstance(rel_path, str):
-                continue
-            # Sanitize: prevent path traversal
-            clean = Path(rel_path).as_posix()
-            if ".." in clean.split("/"):
-                continue
-
-            normalized_content = (
-                content if isinstance(content, str) else json.dumps(content, indent=2)
-            )
-            proposals.append(
-                {
-                    "path": clean,
-                    "content": normalized_content,
-                    "step_index": step_index,
-                    "node_id": node_id,
-                    "workspace_root": str(workspace_dir),
-                }
-            )
-        return proposals
-
-    def _attempt_self_heal(
-        self,
-        *,
-        system_prompt: str,
-        objective: str,
-        step_description: str,
-        step_index: int,
-        total_steps: int,
-        depth: int,
-        prior_context: list[str],
-        profile: PersonaProfile | None,
-        workspace_dir: Path | None = None,
-        original_error: str,
-    ) -> dict[str, Any] | list[Any] | str | int | float | bool | None:
-        """One retry attempt with error context injected into the prompt."""
+    def _self_heal(self, sys_prompt: str, objective: str, desc: str, si: int, total: int,
+                   depth: int, ctx: list[str], profile: PersonaProfile | None, error: str) -> Any:
         try:
-            heal_ctx = self._build_sliding_context(prior_context, objective)
-            if heal_ctx:
-                heal_ctx += "\n"
-            heal_ctx += (
-                f"PREVIOUS ATTEMPT FAILED: {original_error}. "
-                "Fix the issue and try a different approach."
-            )
-            return self._execute_step(
-                system_prompt=system_prompt,
-                objective=objective,
-                step_description=f"[RETRY] {step_description}",
-                step_index=step_index,
-                total_steps=total_steps,
-                depth=depth,
-                prior_context=heal_ctx,
-                profile=profile,
-                workspace_dir=workspace_dir,
-            )
+            heal_ctx = _sliding_context(ctx, objective)
+            heal_ctx += f"\nPREVIOUS ATTEMPT FAILED: {error}. Fix the issue and try a different approach."
+            return self._call_step(sys_prompt, objective, f"[RETRY] {desc}", si, total, depth, heal_ctx, profile)
         except Exception:
             return None
 
-    @staticmethod
-    def _build_sliding_context(steps: list[str], objective: str) -> str:
-        """Sliding window: summarize all-but-last, keep last step in full."""
-        if not steps:
-            return ""
-        if len(steps) == 1:
-            return steps[0]
-        summary_parts = [s.split(": ", 1)[0] for s in steps[:-1]]
-        return (
-            f"Completed: {'; '.join(summary_parts)}\n"
-            f"Last step detail: {steps[-1]}"
-        )
+    def _emit(self, run_id: str, node_id: str, evt: DomainEventType, payload: dict[str, object]) -> None:
+        if self._emitter:
+            self._emitter(run_id, node_id, evt, payload)
 
-    def _execute_step(
-        self,
-        *,
-        system_prompt: str,
-        objective: str,
-        step_description: str,
-        step_index: int,
-        total_steps: int,
-        depth: int,
-        prior_context: str,
-        profile: PersonaProfile | None,
-        workspace_dir: Path | None = None,
-        node_context: NodeContext | None = None,
-    ) -> dict[str, Any] | list[Any] | str | int | float | bool | None:
-        lineage = ""
-        if node_context:
-            lineage = f"\n\n{node_context.to_prompt_block()}"
 
-        context_block = ""
-        if prior_context:
-            context_block = f"\n\nPrior progress:\n{prior_context}"
+# ---- pure functions (no self) ----
 
-        persona_name = profile.name if profile else "General Agent"
-        user_prompt = (
-            f"You are acting as: {persona_name}\n"
-            f"Overall objective: {objective}\n"
-            f"Current step ({step_index}/{total_steps}): {step_description}\n"
-            f"Tree depth: {depth}"
-            f"{lineage}"
-            f"{context_block}\n\n"
-            "Execute this step. Return JSON with 'reasoning' and 'output' fields."
-        )
+def _sliding_context(steps: list[str], objective: str) -> str:
+    if not steps:
+        return ""
+    if len(steps) == 1:
+        return steps[0]
+    summary = [s.split(": ", 1)[0] for s in steps[:-1]]
+    return f"Completed: {'; '.join(summary)}\nLast step detail: {steps[-1]}"
 
-        response = self._llm_client.generate_json(
-            LLMGenerateRequest(
-                messages=[
-                    LLMMessage(role="system", content=system_prompt),
-                    LLMMessage(role="user", content=user_prompt),
-                ],
-                temperature=self._temperature,
-                metadata={
-                    "service": "worker",
-                    "step": str(step_index),
-                    "total_steps": str(total_steps),
-                    "persona": profile.persona_id if profile else "none",
-                },
-            )
-        )
 
-        return response
+def _examples_block(examples: tuple[dict[str, Any], ...]) -> str:
+    parts = ["\n\nExamples of expected input/output:"]
+    for i, ex in enumerate(examples[:3], 1):
+        inp = ex.get("input", ex.get("objective", ""))
+        out = ex.get("output", ex.get("expected", ""))
+        parts.append(f"\nExample {i}:")
+        if inp:
+            parts.append(f"Input: {json.dumps(inp, ensure_ascii=False)[:500]}")
+        if out:
+            parts.append(f"Output: {json.dumps(out, ensure_ascii=False)[:500]}")
+    return "\n".join(parts)
 
-    def _emit_step_started(
-        self,
-        *,
-        run_id: str,
-        node_id: str,
-        step_index: int,
-        description: str,
-        total_steps: int,
-    ) -> None:
-        if self._event_emitter is None:
-            return
-        self._event_emitter(
-            run_id,
-            node_id,
-            DomainEventType.WORK_STEP_STARTED,
-            {
-                "stepIndex": step_index,
-                "description": description,
-                "totalSteps": total_steps,
-            },
-        )
 
-    def _emit_step_completed(
-        self,
-        *,
-        run_id: str,
-        node_id: str,
-        step_index: int,
-        description: str,
-        total_steps: int,
-        error: str | None,
-    ) -> None:
-        if self._event_emitter is None:
-            return
-        payload: dict[str, object] = {
-            "stepIndex": step_index,
-            "description": description,
-            "totalSteps": total_steps,
-            "success": error is None,
-        }
-        if error is not None:
-            payload["error"] = error
-        self._event_emitter(
-            run_id,
-            node_id,
-            DomainEventType.WORK_STEP_COMPLETED,
-            payload,
-        )
+def _run_hook(profile: PersonaProfile, hook_type: str, data: Any) -> Any:
+    if not profile.package_dir:
+        return data
+    hook_path_str = getattr(profile.hooks, hook_type, None)
+    if not hook_path_str:
+        return data
+    hook_path = Path(profile.package_dir) / hook_path_str
+    if not hook_path.exists():
+        return data
+    try:
+        spec = importlib.util.spec_from_file_location(f"hook_{hook_type}", hook_path)
+        if not spec or not spec.loader:
+            return data
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        fn = getattr(mod, "run", None) or getattr(mod, hook_type, None)
+        if callable(fn):
+            return fn(data)
+    except Exception:
+        pass
+    return data
+
+
+def _extract_file_proposals(output: Any, node_id: str, step_index: int) -> list[dict[str, Any]]:
+    if not isinstance(output, dict):
+        return []
+    files = output.get("files", [])
+    if not isinstance(files, list):
+        return []
+    proposals = []
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        rel_path = entry.get("path", "")
+        content = entry.get("content", "")
+        if not rel_path or not isinstance(rel_path, str):
+            continue
+        clean = Path(rel_path).as_posix()
+        if ".." in clean.split("/"):
+            continue
+        proposals.append({
+            "path": clean,
+            "content": content if isinstance(content, str) else json.dumps(content, indent=2),
+            "step_index": step_index, "node_id": node_id,
+        })
+    return proposals
 
 
 __all__ = ["FileProposal", "LLMBaseCaseWorker", "StepResult", "WorkerSchemaError"]

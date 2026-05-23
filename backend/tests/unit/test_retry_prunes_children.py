@@ -48,7 +48,8 @@ class _TwoStageDivider:
         self._call_count = 0
 
     def divide(
-        self, *, objective: str, depth: int, node_context: NodeContext | None = None
+        self, objective: str = "", depth: int = 0,
+        node_context: NodeContext | None = None, **kwargs: Any,
     ) -> DividerServiceResult:
         self._call_count += 1
         if depth == 0:

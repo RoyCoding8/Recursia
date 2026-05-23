@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from app.adapters.llm_client import LLMGenerateRequest
 from app.schemas.contracts import DividerDecision
-from app.services.divider import DividerSchemaError, DividerService
+from app.services.complexity import ComplexityEstimate
+from app.services.divider import DividerSchemaError, DividerService, score_decomposition
 
 
 class StubLLMClient:
@@ -111,3 +112,84 @@ def test_divider_retries_and_raises_on_malformed_outputs() -> None:
     assert llm.calls[0].metadata["attempt"] == "1"
     assert llm.calls[1].metadata["attempt"] == "2"
     assert llm.calls[2].metadata["attempt"] == "3"
+
+
+def test_score_decomposition_prefers_well_formed_recursive() -> None:
+    from app.schemas.contracts import DividerBaseCase, DividerRecursiveCase
+
+    good = DividerRecursiveCase(
+        decision="RECURSIVE_CASE",
+        rationale="Split into backend and frontend with clear contracts.",
+        children=[
+            {"objective": "Build API", "dependencies": [],
+             "suggested_persona": "py_dev", "interface_contract": "REST"},
+            {"objective": "Build UI", "dependencies": ["Build API"],
+             "suggested_persona": "fe_dev", "interface_contract": "SSE"},
+        ],
+    )
+    bad = DividerRecursiveCase(
+        decision="RECURSIVE_CASE",
+        rationale="x",
+        children=[
+            {"objective": "thing1", "dependencies": []},
+            {"objective": "thing1", "dependencies": []},  # duplicate
+        ],
+    )
+    assert score_decomposition(good, "test") > score_decomposition(bad, "test")
+
+
+def test_multi_candidate_picks_best() -> None:
+    responses = [
+        {  # candidate 1: weak (short rationale, no persona)
+            "decision": "BASE_CASE",
+            "rationale": "ok",
+            "work_plan": [{"step": 1, "description": "do it"}],
+        },
+        {  # candidate 2: strong (good structure)
+            "decision": "BASE_CASE",
+            "rationale": "Comprehensive three-step plan with clear separation.",
+            "work_plan": [
+                {"step": 1, "description": "Analyze requirements"},
+                {"step": 2, "description": "Implement solution"},
+                {"step": 3, "description": "Verify with tests"},
+            ],
+            "suggested_persona": "engineer",
+        },
+        {  # candidate 3: medium
+            "decision": "BASE_CASE",
+            "rationale": "Two steps should suffice for this task.",
+            "work_plan": [
+                {"step": 1, "description": "Plan"},
+                {"step": 2, "description": "Execute"},
+            ],
+        },
+    ]
+    llm = StubLLMClient(responses=responses)
+    service = DividerService(llm_client=llm, max_schema_retries=0)
+
+    result = service.divide("Build feature", depth=0, num_candidates=3)
+
+    assert result.decision == DividerDecision.BASE_CASE
+    assert result.candidates_generated == 3
+    assert result.base_case is not None
+    # Best candidate should have 3 work_plan steps and persona
+    assert len(result.base_case.work_plan) == 3
+    assert result.base_case.suggested_persona == "engineer"
+
+
+def test_complexity_hint_injected_into_prompt() -> None:
+    llm = StubLLMClient(responses=[{
+        "decision": "BASE_CASE",
+        "rationale": "Simple task, linear plan.",
+        "work_plan": [{"step": 1, "description": "Do it"}],
+    }])
+    service = DividerService(llm_client=llm)
+    cx = ComplexityEstimate(score=0.75, suggested_depth=5,
+                            model_tier="strong", reasoning="high complexity")
+
+    service.divide("Build system", depth=0, complexity=cx, num_candidates=1)
+
+    prompt = llm.calls[0].messages[1].content
+    assert "Complexity assessment" in prompt
+    assert "high complexity" in prompt
+    assert "Suggested max depth: 5" in prompt

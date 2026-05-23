@@ -38,6 +38,7 @@ from app.services.divider import DividerSchemaError, DividerService
 from app.services.event_stream import EventStreamService
 from app.services.executor import RecursiveExecutor
 from app.services.checker import CheckerService, LLMCheckerClient
+from app.services.execution_checker import build_execution_checker
 from app.services.merger import MergerService
 from app.services.orchestrator import Orchestrator
 from app.services.persona_registry import PersonaRegistry
@@ -121,7 +122,12 @@ def _build_runtime_orchestrator(
         max_schema_retries=config.llm_max_retries,
         temperature=config.llm_temperature,
     )
-    checker = CheckerService(checker_client=LLMCheckerClient(llm_client=llm_client))
+    sandbox_enabled = os.getenv("SANDBOX_ENABLED", "true").lower() in {"true", "1", "yes"}
+    if sandbox_enabled:
+        checker_client = build_execution_checker(llm_client)
+    else:
+        checker_client = LLMCheckerClient(llm_client=llm_client)
+    checker = CheckerService(checker_client=checker_client)
     merger = MergerService(
         llm_client=llm_client,
         max_schema_retries=config.llm_max_retries,

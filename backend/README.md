@@ -112,6 +112,24 @@ uv run pytest tests/integration/test_checker_fail_x3_hitl.py -q
 uv run pytest tests/integration/test_sse_reconnect_replay.py -q
 ```
 
+## Core Features
+
+### Intelligent Decomposition
+The orchestration engine uses heuristic complexity scoring (no LLM calls) to adaptively scale decomposition:
+- **ComplexityEstimator**: Evaluates task length, keywords, depth, and context (like checker failures) to assign a complexity score.
+- **Multi-Candidate Generation**: For complex tasks, the `DividerService` generates multiple candidates at elevated temperature and auto-selects the highest-scored one using a pure-function evaluation.
+- **Adaptive Re-decomposition**: If a task fails repeatedly, the executor intelligently triggers re-decomposition with the failed context injected.
+- **Tuning Knobs**: Configurable via API (`RunConfig.decomposition_candidates`, `re_decompose_after`, `complexity_threshold`).
+
+### Code Sandbox Isolation
+The backend supports pluggable execution environments for AI-generated code:
+- **SubprocessBackend**: Fast, local execution (default).
+- **EpicboxBackend**: Docker-based secure container isolation (production). 
+  - Install via `uv pip install ".[docker]"`
+  - Set `SANDBOX_BACKEND=epicbox` in `.env`
+  - Requires Docker daemon to be running.
+
+
 ## Observability helpers
 
 - `app/observability/logging.py`: structured JSON logging helpers (`configure_structured_logging`, `log_event`, contextual logger binding).

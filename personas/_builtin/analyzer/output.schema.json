@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["complexity", "patterns", "key_challenges", "estimated_subtasks", "needs_decomposition", "suggested_approach", "domain"],
+  "properties": {
+    "complexity": {"type": "string", "enum": ["trivial", "simple", "moderate", "complex", "research"]},
+    "patterns": {"type": "array", "items": {"type": "string"}},
+    "key_challenges": {"type": "array", "items": {"type": "string"}},
+    "estimated_subtasks": {"type": "integer", "minimum": 1},
+    "needs_decomposition": {"type": "boolean"},
+    "suggested_approach": {"type": "string"},
+    "domain": {"type": "string", "enum": ["algorithms", "web", "data", "systems", "math", "other"]}
+  },
+  "additionalProperties": false
+}

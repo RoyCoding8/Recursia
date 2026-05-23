@@ -1,7 +1,7 @@
 [project]
 name = "recursia-backend"
-version = "0.1.0"
-description = "FastAPI backend for Recursia recursive orchestration"
+version = "0.2.0"
+description = "FastAPI backend for Recursia recursive multi-agent orchestration"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -19,3 +19,6 @@ dev = [
     "pytest>=9.0.3",
     "pytest-anyio>=0.0.0",
 ]
+
+[project.optional-dependencies]
+docker = ["epicbox>=1.1.0"]
