@@ -28,6 +28,7 @@ class DomainEventType(str, Enum):
     WORK_STEP_COMPLETED = "work.step_completed"
     RUN_COMPLETED = "run.completed"
     RUN_FAILED = "run.failed"
+    TOKEN_USAGE_RECORDED = "token.usage_recorded"
 
 
 @dataclass(slots=True)

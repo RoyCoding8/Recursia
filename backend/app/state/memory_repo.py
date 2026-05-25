@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import replace
+from typing import Any
 
 from app.domain.events import DomainEvent
 from app.domain.models import (
@@ -16,8 +17,8 @@ from app.domain.models import (
     RunStatus,
     utc_now,
 )
-from app.schemas.api import CheckerConfig
 from app.domain.policies import ensure_node_transition, ensure_run_transition
+from app.schemas.api import CheckerConfig
 from app.state.repository import (
     DuplicateStateError,
     RunStateRepository,
@@ -64,6 +65,12 @@ class InMemoryRunStateRepository(RunStateRepository):
     def list_runs(self) -> list[RunState]:
         return list(self._runs.values())
 
+    def increment_run_tokens(self, run_id: str, amount: int) -> RunState:
+        run = self.get_run(run_id)
+        updated = replace(run, tokens_used=run.tokens_used + amount, updated_at=utc_now())
+        self._runs[run_id] = updated
+        return updated
+
     def create_node(self, node: NodeState) -> None:
         if node.node_id in self._nodes:
             raise DuplicateStateError(f"node already exists: {node.node_id}")
@@ -83,80 +90,55 @@ class InMemoryRunStateRepository(RunStateRepository):
             raise StateNotFoundError(f"run not found: {run_id}")
         return [self._nodes[node_id] for node_id in self._run_nodes[run_id]]
 
+    def _update_node(self, node_id: str, **kwargs: Any) -> NodeState:
+        node = self.get_node(node_id)
+        updated = replace(node, updated_at=utc_now(), **kwargs)
+        self._nodes[node_id] = updated
+        return updated
+
     def update_node_status(self, node_id: str, status: NodeStatus) -> NodeState:
         node = self.get_node(node_id)
         ensure_node_transition(node.status, status)
-        now = utc_now()
-        updated = replace(node, status=status, updated_at=now)
-        self._nodes[node_id] = updated
-        return updated
+        return self._update_node(node_id, status=status)
 
     def update_node_objective(self, node_id: str, objective: str) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, objective=objective, updated_at=utc_now())
-        self._nodes[node_id] = updated
-        return updated
+        return self._update_node(node_id, objective=objective)
 
     def update_node_persona(self, node_id: str, persona_id: str | None) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, persona_id=persona_id, updated_at=utc_now())
-        self._nodes[node_id] = updated
-        return updated
+        return self._update_node(node_id, persona_id=persona_id)
 
     def update_node_kind(self, node_id: str, node_kind: NodeKind) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, node_kind=node_kind, updated_at=utc_now())
-        self._nodes[node_id] = updated
-        return updated
+        return self._update_node(node_id, node_kind=node_kind)
 
     def update_node_checker_policy(self, node_id: str, policy: CheckerConfig) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, checker_policy=policy, updated_at=utc_now())
-        self._nodes[node_id] = updated
-        return updated
+        return self._update_node(node_id, checker_policy=policy)
 
     def increment_node_attempt_count(self, node_id: str) -> NodeState:
         node = self.get_node(node_id)
-        updated = replace(
-            node, attempt_count=node.attempt_count + 1, updated_at=utc_now()
-        )
-        self._nodes[node_id] = updated
-        return updated
+        return self._update_node(node_id, attempt_count=node.attempt_count + 1)
 
     def reset_checker_failures(self, node_id: str) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, consecutive_checker_failures=0, updated_at=utc_now())
-        self._nodes[node_id] = updated
-        return updated
+        return self._update_node(node_id, consecutive_checker_failures=0)
 
     def increment_checker_failures(self, node_id: str) -> NodeState:
         node = self.get_node(node_id)
-        updated = replace(
-            node,
-            consecutive_checker_failures=node.consecutive_checker_failures + 1,
-            updated_at=utc_now(),
-        )
-        self._nodes[node_id] = updated
-        return updated
+        return self._update_node(node_id, consecutive_checker_failures=node.consecutive_checker_failures + 1)
 
     def record_node_started(self, node_id: str) -> NodeState:
         node = self.get_node(node_id)
         ensure_node_transition(node.status, NodeStatus.RUNNING)
         node.mark_running()
-        self._nodes[node_id] = node
         return node
 
     def record_node_first_token(self, node_id: str) -> NodeState:
         node = self.get_node(node_id)
         node.mark_first_token()
-        self._nodes[node_id] = node
         return node
 
     def record_node_ended(self, node_id: str, final_status: NodeStatus) -> NodeState:
         node = self.get_node(node_id)
         ensure_node_transition(node.status, final_status)
         node.mark_ended(final_status=final_status)
-        self._nodes[node_id] = node
         return node
 
     def create_attempt(self, attempt: AttemptState) -> None:
@@ -173,18 +155,10 @@ class InMemoryRunStateRepository(RunStateRepository):
     def create_intervention(self, intervention: InterventionState) -> None:
         node = self.get_node(intervention.node_id)
         if node.run_id != intervention.run_id:
-            raise ValueError(
-                "intervention run_id does not match node run_id: "
-                f"{intervention.run_id} != {node.run_id}"
-            )
+            raise ValueError(f"intervention run_id mismatch: {intervention.run_id} != {node.run_id}")
         interventions = self._interventions[intervention.node_id]
-        if any(
-            existing.intervention_id == intervention.intervention_id
-            for existing in interventions
-        ):
-            raise DuplicateStateError(
-                f"intervention already exists: {intervention.intervention_id}"
-            )
+        if any(i.intervention_id == intervention.intervention_id for i in interventions):
+            raise DuplicateStateError(f"intervention already exists: {intervention.intervention_id}")
         interventions.append(intervention)
 
     def list_node_interventions(self, node_id: str) -> list[InterventionState]:
@@ -192,47 +166,33 @@ class InMemoryRunStateRepository(RunStateRepository):
         return list(self._interventions[node_id])
 
     def delete_node(self, run_id: str, node_id: str) -> None:
-        """Delete a single node and its associated attempts/interventions."""
         if run_id not in self._runs:
             raise StateNotFoundError(f"run not found: {run_id}")
-        node = self._nodes.pop(node_id, None)
-        if node is None:
+        if self._nodes.pop(node_id, None) is None:
             raise StateNotFoundError(f"node not found: {node_id}")
         self._attempts.pop(node_id, None)
         self._interventions.pop(node_id, None)
-        self._run_nodes[run_id] = [
-            nid for nid in self._run_nodes[run_id] if nid != node_id
-        ]
+        self._run_nodes[run_id] = [n for n in self._run_nodes[run_id] if n != node_id]
 
     def delete_children_of(self, run_id: str, parent_node_id: str) -> int:
-        """Recursively delete all descendant nodes of *parent_node_id*."""
         if run_id not in self._runs:
             raise StateNotFoundError(f"run not found: {run_id}")
-
-        # BFS to collect the full subtree rooted at parent_node_id (exclusive)
-        to_visit: list[str] = [parent_node_id]
-        descendant_ids: list[str] = []
+        to_visit, descendants = [parent_node_id], []
         while to_visit:
             current = to_visit.pop()
             for nid in list(self._run_nodes.get(run_id, [])):
                 node = self._nodes.get(nid)
                 if node is not None and node.parent_id == current:
-                    descendant_ids.append(nid)
+                    descendants.append(nid)
                     to_visit.append(nid)
-
-        # Remove descendants from all internal stores
-        for nid in descendant_ids:
+        for nid in descendants:
             self._nodes.pop(nid, None)
             self._attempts.pop(nid, None)
             self._interventions.pop(nid, None)
-
-        if descendant_ids:
-            removed = set(descendant_ids)
-            self._run_nodes[run_id] = [
-                nid for nid in self._run_nodes[run_id] if nid not in removed
-            ]
-
-        return len(descendant_ids)
+        if descendants:
+            removed = set(descendants)
+            self._run_nodes[run_id] = [n for n in self._run_nodes[run_id] if n not in removed]
+        return len(descendants)
 
     def append_event(self, event: DomainEvent) -> DomainEvent:
         if event.run_id not in self._runs:

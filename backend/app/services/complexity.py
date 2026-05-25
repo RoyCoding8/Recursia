@@ -47,7 +47,7 @@ class ComplexityEstimator:
                  depth: int = 0) -> ComplexityEstimate:
         score = self._score_objective(objective, depth)
         if context:
-            score = self._adjust_for_context(score, context, depth)
+            score = self._adjust_for_context(score, context)
         score = max(0.0, min(1.0, score))
         depth_suggestion = self._suggest_depth(score)
         tier = self._select_tier(score)
@@ -93,8 +93,7 @@ class ComplexityEstimator:
 
         return score
 
-    def _adjust_for_context(self, score: float, context: NodeContext,
-                            depth: int) -> float:
+    def _adjust_for_context(self, score: float, context: NodeContext) -> float:
         # Checker feedback = previous failure = harder
         if context.checker_feedback:
             score += 0.15

@@ -6,7 +6,6 @@ from fastapi.testclient import TestClient
 
 from app.domain.events import DomainEventType
 from app.domain.models import NodeState, NodeStatus, RunState, RunStatus
-from app.schemas.api import CheckerConfig
 from app.schemas.contracts import DividerDecision
 from app.services.checker import CheckerRequest, CheckerService
 from app.services.divider import BaseCaseWorkPlan, DividerServiceResult

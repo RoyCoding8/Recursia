@@ -9,13 +9,19 @@ from uuid import uuid4
 from app.domain.events import DomainEvent, DomainEventType
 from app.domain.models import NodeKind, NodeState, NodeStatus, RunState, RunStatus
 from app.schemas.api import RunConfig
+from app.services.event_stream import EventStreamService
 from app.services.executor import (
     ExecutionTerminal,
     NodeExecutionResult,
     RecursiveExecutor,
 )
-from app.services.event_stream import EventStreamService
 from app.state.repository import RunStateRepository
+
+_TERMINAL_MAP: dict[str, tuple[RunStatus, DomainEventType, DomainEventType | None]] = {
+    ExecutionTerminal.COMPLETED: (RunStatus.COMPLETED, DomainEventType.RUN_COMPLETED, None),
+    ExecutionTerminal.BLOCKED_HUMAN: (RunStatus.BLOCKED_HUMAN, DomainEventType.RUN_STATUS_CHANGED, DomainEventType.NODE_BLOCKED_HUMAN),
+    ExecutionTerminal.FAILED: (RunStatus.FAILED, DomainEventType.RUN_FAILED, None),
+}
 
 
 def _default_id_factory() -> str:
@@ -145,29 +151,20 @@ class Orchestrator:
                 run_id=run_id, node_id=root_node_id
             )
         except Exception as exc:  # pragma: no cover - defensive runtime guard
-            error = str(exc)
             self._repository.update_run_status(run_id, RunStatus.FAILED)
             self._append_event(
-                run_id=run_id,
-                node_id=root_node_id,
+                run_id=run_id, node_id=root_node_id,
                 event_type=DomainEventType.RUN_FAILED,
-                payload={"status": RunStatus.FAILED.value, "error": error},
+                payload={"status": RunStatus.FAILED.value, "error": str(exc)},
             )
             return OrchestrationResult(
-                run_id=run_id,
-                root_node_id=root_node_id,
-                status=RunStatus.FAILED.value,
-                error=error,
-                output=None,
+                run_id=run_id, root_node_id=root_node_id,
+                status=RunStatus.FAILED.value, error=str(exc),
             )
 
-        terminal = self._finalize_run_from_node_result(
-            run_id=run_id,
-            root_node_id=root_node_id,
-            node_result=node_result,
+        return self._finalize_run_from_node_result(
+            run_id=run_id, root_node_id=root_node_id, node_result=node_result,
         )
-
-        return terminal
 
     def resume_from_node(self, *, run_id: str, node_id: str) -> OrchestrationResult:
         """Resume execution from a specific node after intervention."""
@@ -176,164 +173,67 @@ class Orchestrator:
 
         try:
             node_result = self._executor.execute_node(run_id=run_id, node_id=node_id)
-        except Exception as exc:  # pragma: no cover - defensive runtime guard
-            error = str(exc)
-            self._repository.update_run_status(run_id, RunStatus.FAILED)
-            self._append_event(
-                run_id=run_id,
-                node_id=node_id,
-                event_type=DomainEventType.RUN_FAILED,
-                payload={"status": RunStatus.FAILED.value, "error": error},
-            )
+        except Exception as exc:
+            self._finalize_run(run_id, node_id, RunStatus.FAILED, str(exc))
             self._executor.clear_run(run_id)
-            return OrchestrationResult(
-                run_id=run_id,
-                root_node_id=root_node_id,
-                status=RunStatus.FAILED.value,
-                error=error,
-                output=None,
-            )
+            return OrchestrationResult(run_id=run_id, root_node_id=root_node_id,
+                                       status=RunStatus.FAILED.value, error=str(exc))
 
         if node_result.status == ExecutionTerminal.BLOCKED_HUMAN:
-            self._repository.update_run_status(run_id, RunStatus.BLOCKED_HUMAN)
-            self._append_event(
-                run_id=run_id,
-                node_id=node_id,
-                event_type=DomainEventType.RUN_STATUS_CHANGED,
-                payload={"status": RunStatus.BLOCKED_HUMAN.value},
-            )
-            return OrchestrationResult(
-                run_id=run_id,
-                root_node_id=root_node_id,
-                status=RunStatus.BLOCKED_HUMAN.value,
-                error=node_result.error,
-                output=node_result.output,
-            )
+            self._finalize_run(run_id, node_id, RunStatus.BLOCKED_HUMAN, node_result.error)
+            return OrchestrationResult(run_id=run_id, root_node_id=root_node_id,
+                                       status=RunStatus.BLOCKED_HUMAN.value,
+                                       error=node_result.error, output=node_result.output)
 
         if node_result.status == ExecutionTerminal.FAILED:
-            self._repository.update_run_status(run_id, RunStatus.FAILED)
-            self._append_event(
-                run_id=run_id,
-                node_id=node_id,
-                event_type=DomainEventType.RUN_FAILED,
-                payload={"status": RunStatus.FAILED.value, "error": node_result.error},
-            )
+            self._finalize_run(run_id, node_id, RunStatus.FAILED, node_result.error)
             self._executor.clear_run(run_id)
-            return OrchestrationResult(
-                run_id=run_id,
-                root_node_id=root_node_id,
-                status=RunStatus.FAILED.value,
-                error=node_result.error,
-                output=node_result.output,
-            )
+            return OrchestrationResult(run_id=run_id, root_node_id=root_node_id,
+                                       status=RunStatus.FAILED.value,
+                                       error=node_result.error, output=node_result.output)
 
         run_nodes = self._repository.list_run_nodes(run_id)
-        if all(node.status == NodeStatus.COMPLETED for node in run_nodes):
-            self._repository.update_run_status(run_id, RunStatus.COMPLETED)
-            self._append_event(
-                run_id=run_id,
-                node_id=root_node_id,
-                event_type=DomainEventType.RUN_COMPLETED,
-                payload={"status": RunStatus.COMPLETED.value},
-            )
+        aggregate = self._aggregate_run_status(run_nodes)
+        self._finalize_run(run_id, root_node_id, aggregate)
+        if aggregate != RunStatus.BLOCKED_HUMAN:
             self._executor.clear_run(run_id)
-            return OrchestrationResult(
-                run_id=run_id,
-                root_node_id=root_node_id,
-                status=RunStatus.COMPLETED.value,
-                output=node_result.output,
-            )
+        return OrchestrationResult(run_id=run_id, root_node_id=root_node_id,
+                                   status=aggregate.value, output=node_result.output)
 
-        if any(node.status == NodeStatus.BLOCKED_HUMAN for node in run_nodes):
-            self._repository.update_run_status(run_id, RunStatus.BLOCKED_HUMAN)
-            self._append_event(
-                run_id=run_id,
-                node_id=root_node_id,
-                event_type=DomainEventType.RUN_STATUS_CHANGED,
-                payload={"status": RunStatus.BLOCKED_HUMAN.value},
-            )
-            return OrchestrationResult(
-                run_id=run_id,
-                root_node_id=root_node_id,
-                status=RunStatus.BLOCKED_HUMAN.value,
-                output=node_result.output,
-            )
-
-        self._repository.update_run_status(run_id, RunStatus.RUNNING)
-        self._append_event(
-            run_id=run_id,
-            node_id=root_node_id,
-            event_type=DomainEventType.RUN_STATUS_CHANGED,
-            payload={"status": RunStatus.RUNNING.value},
-        )
-        return OrchestrationResult(
-            run_id=run_id,
-            root_node_id=root_node_id,
-            status=RunStatus.RUNNING.value,
-            output=node_result.output,
-        )
+    def _finalize_run(self, run_id: str, node_id: str, status: RunStatus,
+                      error: str | None = None) -> None:
+        self._repository.update_run_status(run_id, status)
+        entry = _TERMINAL_MAP.get(status.value, _TERMINAL_MAP[ExecutionTerminal.FAILED])
+        self._append_event(run_id=run_id, node_id=node_id, event_type=entry[1],
+                           payload={"status": status.value, **({"error": error} if error else {})})
+        if entry[2]:
+            self._append_event(run_id=run_id, node_id=node_id, event_type=entry[2],
+                               payload={"status": status.value, "error": error})
 
     def _finalize_run_from_node_result(
-        self,
-        *,
-        run_id: str,
-        root_node_id: str,
-        node_result: NodeExecutionResult,
+        self, *, run_id: str, root_node_id: str, node_result: NodeExecutionResult,
     ) -> OrchestrationResult:
-        if node_result.status == ExecutionTerminal.COMPLETED:
-            self._repository.update_run_status(run_id, RunStatus.COMPLETED)
-            self._append_event(
-                run_id=run_id,
-                node_id=root_node_id,
-                event_type=DomainEventType.RUN_COMPLETED,
-                payload={"status": RunStatus.COMPLETED.value},
-            )
-            return OrchestrationResult(
-                run_id=run_id,
-                root_node_id=root_node_id,
-                status=RunStatus.COMPLETED.value,
-                output=node_result.output,
-            )
-
-        if node_result.status == ExecutionTerminal.BLOCKED_HUMAN:
-            self._repository.update_run_status(run_id, RunStatus.BLOCKED_HUMAN)
-            self._append_event(
-                run_id=run_id,
-                node_id=root_node_id,
-                event_type=DomainEventType.RUN_STATUS_CHANGED,
-                payload={"status": RunStatus.BLOCKED_HUMAN.value},
-            )
-            self._append_event(
-                run_id=run_id,
-                node_id=root_node_id,
-                event_type=DomainEventType.NODE_BLOCKED_HUMAN,
-                payload={
-                    "status": RunStatus.BLOCKED_HUMAN.value,
-                    "error": node_result.error,
-                },
-            )
-            return OrchestrationResult(
-                run_id=run_id,
-                root_node_id=root_node_id,
-                status=RunStatus.BLOCKED_HUMAN.value,
-                error=node_result.error,
-                output=node_result.output,
-            )
-
-        self._repository.update_run_status(run_id, RunStatus.FAILED)
-        self._append_event(
-            run_id=run_id,
-            node_id=root_node_id,
-            event_type=DomainEventType.RUN_FAILED,
-            payload={"status": RunStatus.FAILED.value, "error": node_result.error},
-        )
+        status_map = {
+            ExecutionTerminal.COMPLETED: RunStatus.COMPLETED,
+            ExecutionTerminal.BLOCKED_HUMAN: RunStatus.BLOCKED_HUMAN,
+        }
+        run_status = status_map.get(node_result.status, RunStatus.FAILED)
+        self._finalize_run(run_id, root_node_id, run_status, node_result.error)
+        if run_status != RunStatus.BLOCKED_HUMAN:
+            self._executor.clear_run(run_id)
         return OrchestrationResult(
-            run_id=run_id,
-            root_node_id=root_node_id,
-            status=RunStatus.FAILED.value,
-            error=node_result.error,
-            output=node_result.output,
+            run_id=run_id, root_node_id=root_node_id,
+            status=run_status.value, error=node_result.error, output=node_result.output,
         )
+
+    @staticmethod
+    def _aggregate_run_status(nodes: list[NodeState]) -> RunStatus:
+        statuses = {n.status for n in nodes}
+        if all(s == NodeStatus.COMPLETED for s in statuses):
+            return RunStatus.COMPLETED
+        if NodeStatus.BLOCKED_HUMAN in statuses:
+            return RunStatus.BLOCKED_HUMAN
+        return RunStatus.RUNNING
 
     def _append_event(
         self,

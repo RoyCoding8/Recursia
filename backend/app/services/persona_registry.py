@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,7 +251,7 @@ def parse_legacy_markdown(path: Path) -> ParsedPersona:
 
     system_prompt = ""
     if "System Prompt" in sections:
-        system_prompt = "\n".join(l for _, l in sections["System Prompt"]).strip()
+        system_prompt = "\n".join(line for _, line in sections["System Prompt"]).strip()
 
     guardrails: tuple[str, ...] = ()
     if "Guardrails" in sections:
@@ -314,7 +314,7 @@ def _split_frontmatter(raw: str) -> tuple[str | None, str]:
 
 def _parse_yaml_simple(text: str) -> dict[str, Any]:
     """Minimal YAML parser for frontmatter. Handles scalars, lists, nested dicts.
-    
+
     Defers dict-vs-list decision until first child line is seen.
     """
     lines = text.split("\n")

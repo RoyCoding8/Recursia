@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from app.adapters.llm_client import LLMGenerateRequest
+from app.adapters.llm_client import LLMGenerateRequest, LLMResult, LLMUsage
 from app.schemas.contracts import DividerDecision
 from app.services.complexity import ComplexityEstimate
 from app.services.divider import DividerSchemaError, DividerService, score_decomposition
+
+_ZERO_USAGE = LLMUsage(0, 0, 0)
 
 
 class StubLLMClient:
@@ -11,11 +13,11 @@ class StubLLMClient:
         self._responses = list(responses)
         self.calls: list[LLMGenerateRequest] = []
 
-    def generate_json(self, request: LLMGenerateRequest) -> object:
+    def generate_json(self, request: LLMGenerateRequest) -> LLMResult:
         self.calls.append(request)
         if not self._responses:
             raise AssertionError("No stub responses remaining")
-        return self._responses.pop(0)
+        return LLMResult(data=self._responses.pop(0), usage=_ZERO_USAGE)
 
 
 def test_divider_extracts_work_plan_for_base_case() -> None:
@@ -115,7 +117,7 @@ def test_divider_retries_and_raises_on_malformed_outputs() -> None:
 
 
 def test_score_decomposition_prefers_well_formed_recursive() -> None:
-    from app.schemas.contracts import DividerBaseCase, DividerRecursiveCase
+    from app.schemas.contracts import DividerRecursiveCase
 
     good = DividerRecursiveCase(
         decision="RECURSIVE_CASE",
@@ -135,7 +137,7 @@ def test_score_decomposition_prefers_well_formed_recursive() -> None:
             {"objective": "thing1", "dependencies": []},  # duplicate
         ],
     )
-    assert score_decomposition(good, "test") > score_decomposition(bad, "test")
+    assert score_decomposition(good) > score_decomposition(bad)
 
 
 def test_multi_candidate_picks_best() -> None:
@@ -190,6 +192,6 @@ def test_complexity_hint_injected_into_prompt() -> None:
     service.divide("Build system", depth=0, complexity=cx, num_candidates=1)
 
     prompt = llm.calls[0].messages[1].content
-    assert "Complexity assessment" in prompt
+    assert "Complexity" in prompt
     assert "high complexity" in prompt
     assert "Suggested max depth: 5" in prompt

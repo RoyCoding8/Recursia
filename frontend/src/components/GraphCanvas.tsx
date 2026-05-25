@@ -11,6 +11,7 @@ import ReactFlow, {
   type NodeMouseHandler,
 } from "reactflow";
 import "reactflow/dist/style.css";
+import dagre from "dagre";
 
 import type { GraphEdge, Node } from "@/types/contracts";
 import { inferDecisionFromGraph } from "@/lib/decisionUtils";
@@ -34,65 +35,24 @@ const statusClassMap: Record<Node["status"], string> = {
   merged: "rfNodeMerged",
 };
 
-function computeTreeLayout(
-  nodes: Node[],
-  edges: GraphEdge[],
-): Map<string, { x: number; y: number }> {
+const NODE_W = 280;
+const NODE_H = 120;
+
+function computeTreeLayout(nodes: Node[], edges: GraphEdge[]): Map<string, { x: number; y: number }> {
+  const g = new dagre.graphlib.Graph();
+  g.setDefaultEdgeLabel(() => ({}));
+  g.setGraph({ rankdir: "LR", nodesep: 40, ranksep: 120 });
+
+  for (const node of nodes) g.setNode(node.nodeId, { width: NODE_W, height: NODE_H });
+  for (const edge of edges) g.setEdge(edge.source, edge.target);
+
+  dagre.layout(g);
+
   const positions = new Map<string, { x: number; y: number }>();
-  const childrenOf = new Map<string, string[]>();
-  const nodeById = new Map<string, Node>();
-
   for (const node of nodes) {
-    nodeById.set(node.nodeId, node);
+    const pos = g.node(node.nodeId);
+    if (pos) positions.set(node.nodeId, { x: pos.x - NODE_W / 2, y: pos.y - NODE_H / 2 });
   }
-  for (const edge of edges) {
-    if (edge.relation === "child") {
-      const list = childrenOf.get(edge.source) ?? [];
-      list.push(edge.target);
-      childrenOf.set(edge.source, list);
-    }
-  }
-
-  const root = nodes.find((n) => !n.parentNodeId && (n.depth ?? 0) === 0) ?? nodes[0];
-  if (!root) return positions;
-
-  const NODE_W = 280;
-  const NODE_H = 140;
-  let leafCounter = 0;
-
-  function layout(nodeId: string, depth: number): { min: number; max: number } {
-    const children = childrenOf.get(nodeId) ?? [];
-    if (children.length === 0) {
-      const y = leafCounter * NODE_H;
-      leafCounter++;
-      positions.set(nodeId, { x: depth * NODE_W, y });
-      return { min: y, max: y };
-    }
-    let groupMin = Infinity;
-    let groupMax = -Infinity;
-    for (const childId of children) {
-      const childNode = nodeById.get(childId);
-      const childDepth = childNode?.depth ?? depth + 1;
-      const range = layout(childId, childDepth);
-      groupMin = Math.min(groupMin, range.min);
-      groupMax = Math.max(groupMax, range.max);
-    }
-    const centerY = (groupMin + groupMax) / 2;
-    positions.set(nodeId, { x: depth * NODE_W, y: centerY });
-    return { min: groupMin, max: groupMax };
-  }
-
-  layout(root.nodeId, 0);
-
-  // Position any orphan nodes not in the tree
-  for (const node of nodes) {
-    if (!positions.has(node.nodeId)) {
-      const y = leafCounter * NODE_H;
-      leafCounter++;
-      positions.set(node.nodeId, { x: (node.depth ?? 0) * NODE_W, y });
-    }
-  }
-
   return positions;
 }
 
@@ -191,7 +151,7 @@ export function GraphCanvas({ nodes, edges, selectedNodeId, onSelectNode, runId,
       console.error("Failed to delete node:", err);
     }
     setContextMenu(null);
-  }, [contextMenu, runId, nodes, edges, onDeleteNode]);
+  }, [contextMenu, runId, edges, onDeleteNode]);
 
   const contextMenuNode = contextMenu ? nodes.find((n) => n.nodeId === contextMenu.nodeId) : null;
   const isRootNode = contextMenuNode ? !contextMenuNode.parentNodeId : false;

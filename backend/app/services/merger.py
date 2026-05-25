@@ -68,7 +68,7 @@ class MergerService:
         for attempt in range(1, max_attempts + 1):
             response_payload = self._llm_client.generate_json(
                 request=self._build_request(request=request, attempt=attempt)
-            )
+            ).data
 
             try:
                 parsed = self._MERGE_RESPONSE_ADAPTER.validate_python(response_payload)
@@ -86,88 +86,40 @@ class MergerService:
             f"merger output failed schema validation after {max_attempts} attempts"
         ) from last_validation_error
 
-    def _build_request(
-        self, *, request: MergeRequest, attempt: int
-    ) -> LLMGenerateRequest:
-        repair_hint = ""
-        if attempt > 1:
-            repair_hint = (
-                " Previous output was invalid. Respond with strict JSON only "
-                "and include all required fields."
-            )
-
-        child_inputs = [
-            {
-                "node_id": child.node_id,
-                "persona_id": child.persona_id,
-                "boundary_contract": child.boundary_contract,
-                "output": child.output,
-            }
-            for child in request.child_outputs
+    def _build_request(self, *, request: MergeRequest, attempt: int) -> LLMGenerateRequest:
+        children = [{"node_id": c.node_id, "persona_id": c.persona_id,
+                     "boundary_contract": c.boundary_contract, "output": c.output}
+                    for c in request.child_outputs]
+        parts = [
+            "Synthesize sibling outputs into one coherent result. Resolve conflicts explicitly.",
+            f"Parent objective: {request.parent_objective}.",
+            f"Child inputs: {json.dumps(children, ensure_ascii=False, sort_keys=True)[:3000]}.",
         ]
-
-        prompt = (
-            "Synthesize sibling outputs into one coherent result. "
-            "Resolve interface and assumption conflicts explicitly. "
-            f"Parent objective: {request.parent_objective}. "
-            f"Child inputs: {json.dumps(child_inputs, ensure_ascii=False, sort_keys=True)[:3000]}."
-            f"{repair_hint}"
-        )
-
+        if attempt > 1:
+            parts.append("Previous output invalid. Respond with strict JSON only.")
         return LLMGenerateRequest(
             messages=[
-                LLMMessage(
-                    role="system",
-                    content="Return JSON: {merged_output, conflict_resolutions:"
-                    "[{conflict,chosen_approach,rejected_approach?,rationale}], "
-                    "unresolved_conflicts:[string]}.",
-                ),
-                LLMMessage(role="user", content=prompt),
+                LLMMessage(role="system", content='Return JSON: {merged_output, conflict_resolutions: [{conflict, chosen_approach, rationale}], unresolved_conflicts: [string]}.'),
+                LLMMessage(role="user", content=" ".join(parts)),
             ],
             temperature=self._temperature,
-            metadata={
-                "service": "merger",
-                "attempt": str(attempt),
-                "child_count": str(len(request.child_outputs)),
-            },
+            metadata={"service": "merger", "attempt": str(attempt), "child_count": str(len(request.child_outputs))},
         )
 
-    def _to_service_result(
-        self,
-        *,
-        parsed: MergeResponse,
-        started_event: MergerEvent,
-        attempts_used: int,
-    ) -> MergerServiceResult:
+    def _to_service_result(self, *, parsed: MergeResponse, started_event: MergerEvent,
+                           attempts_used: int) -> MergerServiceResult:
         has_unresolved = len(parsed.unresolved_conflicts) > 0
-        completed_event = MergerEvent(
-            event_type="merge.completed",
-            payload={
-                "conflict_resolutions": [
-                    resolution.model_dump()
-                    for resolution in parsed.conflict_resolutions
-                ],
-                "unresolved_conflicts": list(parsed.unresolved_conflicts),
-                "has_unresolved_conflicts": has_unresolved,
-            },
-        )
-
-        checker_payload = {
-            "merged_output": parsed.merged_output,
-            "conflict_resolutions": [
-                resolution.model_dump() for resolution in parsed.conflict_resolutions
-            ],
-            "unresolved_conflicts": list(parsed.unresolved_conflicts),
-            "integration_ready": not has_unresolved,
-        }
-
+        resolutions = [r.model_dump() for r in parsed.conflict_resolutions]
+        unresolved = list(parsed.unresolved_conflicts)
+        completed = MergerEvent("merge.completed", {
+            "conflict_resolutions": resolutions, "unresolved_conflicts": unresolved,
+            "has_unresolved_conflicts": has_unresolved})
         return MergerServiceResult(
             response=parsed,
-            checker_payload=checker_payload,
-            has_unresolved_conflicts=has_unresolved,
-            attempts_used=attempts_used,
-            events=(started_event, completed_event),
-        )
+            checker_payload={"merged_output": parsed.merged_output, "conflict_resolutions": resolutions,
+                             "unresolved_conflicts": unresolved, "integration_ready": not has_unresolved},
+            has_unresolved_conflicts=has_unresolved, attempts_used=attempts_used,
+            events=(started_event, completed))
 
 
 __all__ = [

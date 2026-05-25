@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from app.adapters.llm_client import LLMGenerateRequest
+from app.adapters.llm_client import LLMGenerateRequest, LLMResult, LLMUsage
 from app.schemas.contracts import MergeRequest, MergeResponse
 from app.services.merger import MergerSchemaError, MergerService
+
+_ZERO_USAGE = LLMUsage(0, 0, 0)
 
 
 class StubLLMClient:
@@ -10,11 +12,11 @@ class StubLLMClient:
         self._responses = list(responses)
         self.calls: list[LLMGenerateRequest] = []
 
-    def generate_json(self, request: LLMGenerateRequest) -> object:
+    def generate_json(self, request: LLMGenerateRequest) -> LLMResult:
         self.calls.append(request)
         if not self._responses:
             raise AssertionError("No stub responses remaining")
-        return self._responses.pop(0)
+        return LLMResult(data=self._responses.pop(0), usage=_ZERO_USAGE)
 
 
 def _build_request() -> MergeRequest:

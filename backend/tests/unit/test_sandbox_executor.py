@@ -1,10 +1,13 @@
 """Tests for sandbox executor — subprocess code runner."""
 from __future__ import annotations
 
-import pytest
 from app.sandbox.executor import (
-    ExecResult, Language, SandboxExecutor, SuiteResult,
-    TestCase, TestResult, detect_language,
+    ExecResult,
+    Language,
+    SandboxExecutor,
+    SuiteResult,
+    TestCase,
+    detect_language,
 )
 
 

@@ -30,35 +30,16 @@ class EventEnvelope:
 
 
 def serialize_event(event: DomainEvent) -> EventEnvelope:
-    """Convert a domain event into transport-safe envelope."""
-    return EventEnvelope(
-        event_id=event.event_id,
-        run_id=event.run_id,
-        node_id=event.node_id,
-        seq=event.seq,
-        type=event.type.value,
-        ts=event.ts.isoformat(),
-        payload=dict(event.payload),
-    )
+    return EventEnvelope(event_id=event.event_id, run_id=event.run_id, node_id=event.node_id,
+                         seq=event.seq, type=event.type.value, ts=event.ts.isoformat(),
+                         payload=dict(event.payload))
 
 
 def format_sse(event: DomainEvent) -> str:
-    """Format one domain event as a Server-Sent Event frame."""
-    envelope = serialize_event(event)
-    body = {
-        "event_id": envelope.event_id,
-        "run_id": envelope.run_id,
-        "node_id": envelope.node_id,
-        "seq": envelope.seq,
-        "type": envelope.type,
-        "ts": envelope.ts,
-        "payload": envelope.payload,
-    }
-    return (
-        f"id: {envelope.seq}\n"
-        f"event: {envelope.type}\n"
-        f"data: {json.dumps(body, separators=(',', ':'))}\n\n"
-    )
+    e = serialize_event(event)
+    body = {"event_id": e.event_id, "run_id": e.run_id, "node_id": e.node_id,
+            "seq": e.seq, "type": e.type, "ts": e.ts, "payload": e.payload}
+    return f"id: {e.seq}\nevent: {e.type}\ndata: {json.dumps(body, separators=(',', ':'))}\n\n"
 
 
 class EventStreamService:
@@ -83,31 +64,16 @@ class EventStreamService:
                 continue
         return stored
 
-    def publish_ttft(
-        self,
-        *,
-        run_id: str,
-        node_id: str,
-        ttft_ms: int,
-        started_at: datetime | None = None,
-        first_token_at: datetime | None = None,
-        event_id: str,
-    ) -> DomainEvent:
-        """Publish a typed TTFT metric event for first token timing."""
+    def publish_ttft(self, *, run_id: str, node_id: str, ttft_ms: int,
+                     started_at: datetime | None = None, first_token_at: datetime | None = None,
+                     event_id: str) -> DomainEvent:
         payload: dict[str, object] = {"ttft_ms": ttft_ms}
         if started_at is not None:
             payload["started_at"] = started_at.isoformat()
         if first_token_at is not None:
             payload["first_token_at"] = first_token_at.isoformat()
-        return self.publish(
-            DomainEvent(
-                event_id=event_id,
-                run_id=run_id,
-                node_id=node_id,
-                type=DomainEventType.NODE_TTFT_RECORDED,
-                payload=payload,
-            )
-        )
+        return self.publish(DomainEvent(event_id=event_id, run_id=run_id, node_id=node_id,
+                                        type=DomainEventType.NODE_TTFT_RECORDED, payload=payload))
 
     def list_events(self, *, run_id: str, after_seq: int = 0) -> list[DomainEvent]:
         """List persisted events after sequence for replay semantics."""

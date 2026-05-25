@@ -27,7 +27,7 @@ export interface RunConfig {
   };
   maxDepth: number;
   maxChildrenPerNode: number;
-  stream: {
+  stream?: {
     mode: "sse" | "websocket";
   };
 }
@@ -39,6 +39,7 @@ export interface Run {
   rootNodeId: string;
   createdAt?: string;
   updatedAt?: string;
+  tokensUsed?: number;
 }
 
 export interface Node {
@@ -123,7 +124,7 @@ export type InterventionRequest =
 
 export interface InterventionResponse {
   accepted: boolean;
-  nodeStatus: NodeStatus | string;
+  nodeStatus: NodeStatus;
   interventionId: string;
 }
 
@@ -144,7 +145,8 @@ export type RunEventType =
   | "work.step_started"
   | "work.step_completed"
   | "run.completed"
-  | "run.failed";
+  | "run.failed"
+  | "token.usage_recorded";
 
 export interface EventEnvelope<TPayload = unknown> {
   eventId: string;

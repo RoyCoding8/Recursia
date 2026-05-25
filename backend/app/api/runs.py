@@ -2,23 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Annotated
-from uuid import uuid4
-from pathlib import Path
-import threading
+import logging
 import os
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Annotated, Any
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from app.adapters.llm_factory import build_llm_client
 from app.adapters.llm_client import LLMClientRuntimeError
-from app.api.events import set_event_stream_service
-from app.config import ConfigError, load_config_from_env
-from app.domain.events import DomainEvent, DomainEventType
 from app.domain.enums import InterventionAction, NodeStatus, RunStatus
-from app.domain.models import InterventionState
+from app.domain.events import DomainEvent, DomainEventType
+from app.domain.models import InterventionState, NodeState
 from app.schemas.api import (
     CreateRunRequest,
     CreateRunResponse,
@@ -26,54 +24,151 @@ from app.schemas.api import (
     EditAndRetryIntervention,
     GetRunResponse,
     InterventionRequest,
-    RunResultResponse,
     InterventionResponse,
     NodeView,
     RetryIntervention,
-    RunView,
-    SkipWithJustificationIntervention,
+    RunResultResponse,
     RunValidationResult,
+    RunView,
 )
-from app.services.divider import DividerSchemaError, DividerService
+from app.services.divider import DividerSchemaError
 from app.services.event_stream import EventStreamService
 from app.services.executor import RecursiveExecutor
-from app.services.checker import CheckerService, LLMCheckerClient
-from app.services.execution_checker import build_execution_checker
-from app.services.merger import MergerService
 from app.services.orchestrator import Orchestrator
 from app.services.persona_registry import PersonaRegistry
-from app.services.persona_router import PersonaRouter
 from app.services.stubs import DeterministicDivider, DeterministicPersonaRouter
-from app.services.worker import LLMBaseCaseWorker
-from app.state.memory_repo import InMemoryRunStateRepository
 from app.state.repository import RunStateRepository
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
+
+_log = logging.getLogger(__name__)
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+# ---------------------------------------------------------------------------
+# Single shared state dict — populated by lifespan or set_runs_services
+# ---------------------------------------------------------------------------
+
+_active: dict[str, Any] = {}
+_run_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="run-worker")
+_active_runs: set[str] = set()
+_active_runs_lock = threading.Lock()
+
+
+def set_orchestrator_error(exc: Exception | None) -> None:
+    """Store/clear orchestrator init error (called by lifespan)."""
+    if exc is None:
+        _active.pop("orchestrator_error", None)
+    else:
+        _active["orchestrator_error"] = exc
+
+
+def _ensure_services() -> None:
+    """Auto-initialize services if nothing is set yet (e.g. standalone test client)."""
+    if "repository" in _active:
+        return
+    from app.__init__ import _build_default_repository
+    try:
+        repository = _build_default_repository()
+        event_stream = EventStreamService(repository=repository)
+        orchestrator = _build_runtime_orchestrator(repository=repository, event_stream=event_stream)
+        set_runs_services(repository=repository, orchestrator=orchestrator, event_stream=event_stream)
+    except Exception as exc:
+        _active["orchestrator_error"] = str(exc)
+
+
+def set_runs_services(
+    *,
+    repository: RunStateRepository,
+    orchestrator: Orchestrator,
+    event_stream: EventStreamService,
+) -> None:
+    """Override services for integration wiring and tests."""
+    from app.api.events import set_event_stream_service
+    _active["repository"] = repository
+    _active["orchestrator"] = orchestrator
+    _active["event_stream"] = event_stream
+    # Clear any error from failed startup
+    _active.pop("orchestrator_error", None)
+    set_event_stream_service(event_stream)
+
+
+def reset_runs_services() -> None:
+    """Clear service overrides (primarily for tests)."""
+    from app.api.events import set_event_stream_service
+    _active.pop("repository", None)
+    _active.pop("orchestrator", None)
+    _active.pop("event_stream", None)
+    _active.pop("orchestrator_error", None)
+    set_event_stream_service(None)
+
+
+# ---------------------------------------------------------------------------
+# Dependency functions
+# ---------------------------------------------------------------------------
+
+def get_run_repository() -> RunStateRepository:
+    repo = _active.get("repository")
+    if repo is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Repository not initialized")
+    return repo
+
+
+def get_orchestrator() -> Orchestrator:
+    orch = _active.get("orchestrator")
+    if orch is None:
+        error = _active.get("orchestrator_error")
+        detail = "Orchestrator not initialized"
+        if error:
+            detail = f"{detail}: {error}"
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail)
+    return orch
+
+
+def get_event_stream() -> EventStreamService:
+    stream = _active.get("event_stream")
+    if stream is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Event stream not initialized")
+    return stream
+
+
+def provider_readiness(*, force_refresh: bool = True) -> tuple[bool, str | None]:
+    """Return provider readiness and actionable non-secret reason when unhealthy."""
+    _ensure_services()
+    if _active.get("orchestrator") is not None:
+        return True, None
+    error = _active.get("orchestrator_error")
+    reason = (
+        "Default orchestrator failed to initialize. Configure a live provider "
+        "(LLM_PROVIDER=gemini|groq|bedrock with required credentials) or set "
+        "LLM_PROVIDER=stub explicitly for deterministic dev/test fallback."
+    )
+    if error:
+        reason = f"{reason} Details: {error}"
+    return False, reason
+
+
+def get_run_executor() -> ThreadPoolExecutor:
+    return _run_executor
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def _bool_env(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in _TRUTHY
 
 
 def _default_id_factory() -> str:
     return uuid4().hex
 
 
-def _build_event_publisher(
-    event_stream: EventStreamService,
-) -> Callable[[str, str, DomainEventType, dict[str, object]], None]:
-    def _publish(
-        run_id: str,
-        node_id: str,
-        event_type: DomainEventType,
-        payload: dict[str, object],
-    ) -> None:
-        event_stream.publish(
-            DomainEvent(
-                event_id=f"evt_{_default_id_factory()}",
-                run_id=run_id,
-                node_id=node_id,
-                type=event_type,
-                payload=payload,
-            )
-        )
-
+def _build_event_publisher(event_stream: EventStreamService) -> Callable:
+    def _publish(run_id, node_id, event_type, payload):
+        event_stream.publish(DomainEvent(
+            event_id=f"evt_{_default_id_factory()}", run_id=run_id,
+            node_id=node_id, type=event_type, payload=payload))
     return _publish
 
 
@@ -102,176 +197,50 @@ def _build_runtime_orchestrator(
     repository: RunStateRepository,
     event_stream: EventStreamService | None = None,
 ) -> Orchestrator:
-    """Provider-backed runtime orchestrator used by production default wiring."""
-    if os.getenv("CONTEXT_MANAGER_FORCE_STUB", "0").strip() in {
-        "1",
-        "true",
-        "TRUE",
-        "yes",
-        "on",
-    }:
-        return _build_stub_orchestrator(
-            repository=repository,
-            event_stream=event_stream,
-        )
+    """Provider-backed runtime orchestrator. Used by tests and internal wiring."""
+    from app.adapters.llm_factory import build_llm_client
+    from app.config import load_config_from_env
+    from app.services.checker import CheckerService, LLMCheckerClient
+    from app.services.divider import DividerService
+    from app.services.execution_checker import build_execution_checker
+    from app.services.merger import MergerService
+    from app.services.persona_registry import PersonaRegistry
+    from app.services.persona_router import PersonaRouter
+    from app.services.worker import LLMBaseCaseWorker
 
     config = load_config_from_env()
     llm_client = build_llm_client(config)
-    divider = DividerService(
-        llm_client=llm_client,
-        max_schema_retries=config.llm_max_retries,
-        temperature=config.llm_temperature,
-    )
-    sandbox_enabled = os.getenv("SANDBOX_ENABLED", "true").lower() in {"true", "1", "yes"}
-    if sandbox_enabled:
-        checker_client = build_execution_checker(llm_client)
-    else:
-        checker_client = LLMCheckerClient(llm_client=llm_client)
+    sandbox_enabled = _bool_env("SANDBOX_ENABLED", "true")
+
+    checker_client = build_execution_checker(llm_client) if sandbox_enabled else LLMCheckerClient(llm_client=llm_client)
     checker = CheckerService(checker_client=checker_client)
-    merger = MergerService(
-        llm_client=llm_client,
-        max_schema_retries=config.llm_max_retries,
-        temperature=config.llm_temperature,
-    )
+    divider = DividerService(llm_client=llm_client, max_schema_retries=config.llm_max_retries, temperature=config.llm_temperature)
+    merger = MergerService(llm_client=llm_client, max_schema_retries=config.llm_max_retries, temperature=config.llm_temperature)
+
     event_emitter = _build_event_publisher(event_stream) if event_stream else None
     personas_dir = Path(__file__).resolve().parents[3] / "personas"
     registry = PersonaRegistry(personas_dir)
     registry.reload()
-    worker = LLMBaseCaseWorker(
-        llm_client=llm_client,
-        persona_registry=registry,
-        temperature=config.llm_temperature,
-        event_emitter=event_emitter,
-    )
-    executor = RecursiveExecutor(
-        repository=repository,
-        divider=divider,
-        persona_router=PersonaRouter(registry=registry),
-        worker=worker,
-        checker=checker,
-        merger=merger,
-        event_emitter=event_emitter,
-    )
-    return Orchestrator(
-        repository=repository,
-        executor=executor,
-        event_stream=event_stream,
-    )
 
-
-_default_repository = InMemoryRunStateRepository()
-_default_event_stream = EventStreamService(repository=_default_repository)
-_default_orchestrator: Orchestrator | None = None
-_default_orchestrator_error: Exception | None = None
-_service_lock = threading.RLock()
-_services_overridden = False
-_run_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="run-worker")
-
-try:
-    _default_orchestrator = _build_runtime_orchestrator(
-        repository=_default_repository,
-        event_stream=_default_event_stream,
-    )
-except Exception as exc:  # pragma: no cover - exercised via dependency access
-    _default_orchestrator_error = exc
-
-_repository: RunStateRepository = _default_repository
-_orchestrator: Orchestrator | None = _default_orchestrator
-_event_stream: EventStreamService = _default_event_stream
-set_event_stream_service(_event_stream)
-
-
-def set_runs_services(
-    *,
-    repository: RunStateRepository,
-    orchestrator: Orchestrator,
-    event_stream: EventStreamService,
-) -> None:
-    """Override services for integration wiring and tests."""
-    global _repository, _orchestrator, _event_stream, _services_overridden
-    with _service_lock:
-        _repository = repository
-        _orchestrator = orchestrator
-        _event_stream = event_stream
-        _services_overridden = True
-        set_event_stream_service(event_stream)
-
-
-def reset_runs_services() -> None:
-    """Reset to default runtime service wiring (primarily for tests)."""
-    global _repository, _orchestrator, _event_stream, _services_overridden
-    with _service_lock:
-        _repository = _default_repository
-        _orchestrator = _default_orchestrator
-        _event_stream = _default_event_stream
-        _services_overridden = False
-        set_event_stream_service(_default_event_stream)
-
-
-def get_run_repository() -> RunStateRepository:
-    return _repository
-
-
-_ORCHESTRATOR_ERROR_MSG = (
-    "Default orchestrator failed to initialize. Configure a live provider "
-    "(LLM_PROVIDER=gemini|groq|bedrock with required credentials) or set "
-    "LLM_PROVIDER=stub explicitly for deterministic dev/test fallback."
-)
-
-
-def _refresh_orchestrator(*, force: bool) -> None:
-    """Refresh orchestrator if needed. Thread-safe."""
-    global _orchestrator, _default_orchestrator_error
-    if _services_overridden or (_orchestrator and not force):
-        return
-    try:
-        _orchestrator = _build_runtime_orchestrator(
-            repository=_repository,
-            event_stream=_event_stream,
-        )
-        _default_orchestrator_error = None
-    except Exception as exc:  # pragma: no cover
-        _orchestrator = None
-        _default_orchestrator_error = exc
+    worker = LLMBaseCaseWorker(llm_client=llm_client, persona_registry=registry, temperature=config.llm_temperature, event_emitter=event_emitter)
+    executor = RecursiveExecutor(repository=repository, divider=divider, persona_router=PersonaRouter(registry=registry), worker=worker, checker=checker, merger=merger, event_emitter=event_emitter)
+    return Orchestrator(repository=repository, executor=executor, event_stream=event_stream)
 
 
 def _load_persona_registry() -> PersonaRegistry:
+    # Try shared registry first
+    registry = _active.get("registry")
+    if registry is not None:
+        return registry
     personas_dir = Path(__file__).resolve().parents[3] / "personas"
     registry = PersonaRegistry(personas_dir)
     registry.reload()
     return registry
 
 
-def provider_readiness(*, force_refresh: bool = True) -> tuple[bool, str | None]:
-    """Return provider readiness and actionable non-secret reason when unhealthy."""
-    with _service_lock:
-        _refresh_orchestrator(force=force_refresh)
-        if _orchestrator is None:
-            reason = _ORCHESTRATOR_ERROR_MSG
-            if _default_orchestrator_error:
-                reason = f"{reason} Details: {_default_orchestrator_error}"
-            return False, reason
-
-        return True, None
-
-
-def get_orchestrator() -> Orchestrator:
-    """Get orchestrator dependency. Raises HTTPException if unavailable."""
-    with _service_lock:
-        _refresh_orchestrator(force=_orchestrator is None)
-        if _orchestrator is None:
-            detail = _ORCHESTRATOR_ERROR_MSG
-            if isinstance(_default_orchestrator_error, ConfigError):
-                detail = f"{detail} Details: {_default_orchestrator_error}"
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail
-            )
-        return _orchestrator
-
-
-def get_event_stream() -> EventStreamService:
-    return _event_stream
-
+# ---------------------------------------------------------------------------
+# Endpoint handlers
+# ---------------------------------------------------------------------------
 
 @router.post("", response_model=CreateRunResponse, status_code=status.HTTP_201_CREATED)
 def create_run(
@@ -279,6 +248,15 @@ def create_run(
     orchestrator: Orchestrator = Depends(get_orchestrator),
 ) -> CreateRunResponse:
     """Create run + root node and launch orchestration asynchronously."""
+    _MAX_OBJECTIVE_LEN = 10000
+    objective = request.objective.strip()
+    if not objective:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="objective must not be empty")
+    if len(objective) > _MAX_OBJECTIVE_LEN:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"objective exceeds maximum length ({len(objective)}/{_MAX_OBJECTIVE_LEN})",
+        )
     if request.base_persona_id:
         registry = _load_persona_registry()
         if not registry.has_profile(request.base_persona_id):
@@ -288,10 +266,18 @@ def create_run(
             )
     try:
         created = orchestrator.create_run(
-            objective=request.objective,
+            objective=objective,
             config=request.config,
             base_persona_id=request.base_persona_id,
         )
+
+        with _active_runs_lock:
+            if created.run_id in _active_runs:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"run {created.run_id} is already executing",
+                )
+            _active_runs.add(created.run_id)
 
         def _run_background() -> None:
             try:
@@ -300,8 +286,26 @@ def create_run(
                     root_node_id=created.root_node_id,
                 )
             except Exception:
-                # Orchestrator emits failure state/events.
-                return
+                _log.warning("run_existing failed for run=%s", created.run_id, exc_info=True)
+                repo = _active.get("repository")
+                stream = _active.get("event_stream")
+                if repo:
+                    try:
+                        repo.update_run_status(created.run_id, RunStatus.FAILED)
+                    except Exception:
+                        pass
+                if stream:
+                    try:
+                        stream.publish(DomainEvent(
+                            event_id=f"evt_{_default_id_factory()}", run_id=created.run_id,
+                            node_id=created.root_node_id, type=DomainEventType.RUN_FAILED,
+                            payload={"status": RunStatus.FAILED.value, "error": "background_execution_failed"},
+                        ))
+                    except Exception:
+                        pass
+            finally:
+                with _active_runs_lock:
+                    _active_runs.discard(created.run_id)
 
         _run_executor.submit(_run_background)
     except (LLMClientRuntimeError, DividerSchemaError, RuntimeError) as exc:
@@ -332,26 +336,15 @@ def get_run_graph(
         ) from exc
 
     typed_nodes = [
-        NodeView(
-            node_id=node.node_id,
-            run_id=node.run_id,
-            parent_id=node.parent_id,
-            depth=node.depth,
-            objective=node.objective,
-            status=NodeStatus(node.status.value),
-            node_kind=node.node_kind.value,
-            persona_id=node.persona_id,
-            ttft_ms=node.ttft_ms,
-            duration_ms=node.duration_ms,
-            checker_failure_count=node.consecutive_checker_failures,
-        )
-        for node in sorted(nodes, key=lambda item: (item.depth, item.node_id))
+        NodeView(node_id=n.node_id, run_id=n.run_id, parent_id=n.parent_id,
+                 depth=n.depth, objective=n.objective, status=NodeStatus(n.status.value),
+                 node_kind=n.node_kind.value, persona_id=n.persona_id,
+                 ttft_ms=n.ttft_ms, duration_ms=n.duration_ms,
+                 checker_failure_count=n.consecutive_checker_failures)
+        for n in sorted(nodes, key=lambda n: (n.depth, n.node_id))
     ]
-    typed_edges = [
-        EdgeView(source=node.parent_id, target=node.node_id, relation="child")
-        for node in nodes
-        if node.parent_id is not None
-    ]
+    typed_edges = [EdgeView(source=n.parent_id, target=n.node_id, relation="child")
+                   for n in nodes if n.parent_id is not None]
 
     return GetRunResponse(
         run=RunView(
@@ -460,9 +453,39 @@ _ELIGIBLE_INTERVENTION_STATUSES = {
 }
 
 
-@router.post(
-    "/{run_id}/nodes/{node_id}/interventions", response_model=InterventionResponse
-)
+def _resolve_intervention(
+    *,
+    request: InterventionRequest,
+    node: NodeState,
+    repository: RunStateRepository,
+    node_id: str,
+) -> tuple[InterventionAction, str, dict[str, object], NodeStatus]:
+    if isinstance(request, RetryIntervention):
+        return InterventionAction.RETRY, request.note, {}, NodeStatus.RUNNING
+
+    if isinstance(request, EditAndRetryIntervention):
+        repository.update_node_objective(node_id, request.edited_objective)
+        return (
+            InterventionAction.EDIT_AND_RETRY,
+            request.note,
+            {"edited_objective": request.edited_objective, "edited_context": request.edited_context},
+            NodeStatus.RUNNING,
+        )
+
+    if node.status != NodeStatus.BLOCKED_HUMAN:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="skip_with_justification requires blocked_human node status",
+        )
+    return (
+        InterventionAction.SKIP_WITH_JUSTIFICATION,
+        request.justification,
+        {"justification": request.justification},
+        NodeStatus.COMPLETED,
+    )
+
+
+@router.post("/{run_id}/nodes/{node_id}/interventions", response_model=InterventionResponse)
 def apply_intervention(
     run_id: str,
     node_id: str,
@@ -500,88 +523,45 @@ def apply_intervention(
     resolved_actor = actor or "system:api"
     intervention_id = f"int_{_default_id_factory()}"
 
-    # Determine intervention action, payload, and target status
-    if isinstance(request, RetryIntervention):
-        action, note, payload_delta, target_status = (
-            InterventionAction.RETRY,
-            request.note,
-            {},
-            NodeStatus.RUNNING,
-        )
-    elif isinstance(request, EditAndRetryIntervention):
-        action, note, target_status = (
-            InterventionAction.EDIT_AND_RETRY,
-            request.note,
-            NodeStatus.RUNNING,
-        )
-        payload_delta = {
-            "edited_objective": request.edited_objective,
-            "edited_context": request.edited_context,
-        }
-        node = repository.update_node_objective(node_id, request.edited_objective)
-    else:  # SkipWithJustificationIntervention
-        if node.status != NodeStatus.BLOCKED_HUMAN:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="skip_with_justification requires blocked_human node status",
-            )
-        action, note, target_status = (
-            InterventionAction.SKIP_WITH_JUSTIFICATION,
-            request.justification,
-            NodeStatus.COMPLETED,
-        )
-        payload_delta = {"justification": request.justification}
-
-    repository.create_intervention(
-        InterventionState(
-            intervention_id=intervention_id,
-            run_id=run_id,
-            node_id=node_id,
-            action=action,
-            actor=resolved_actor,
-            note=note,
-            payload_delta=payload_delta,
-        )
+    action, note, payload_delta, target_status = _resolve_intervention(
+        request=request, node=node, repository=repository, node_id=node_id,
     )
+
+    def _evt(rtype, payload):
+        return DomainEvent(event_id=f"evt_{_default_id_factory()}", run_id=run_id,
+                           node_id=node_id, type=rtype, payload=payload)
+
+    repository.create_intervention(InterventionState(
+        intervention_id=intervention_id, run_id=run_id, node_id=node_id,
+        action=action, actor=resolved_actor, note=note, payload_delta=payload_delta))
 
     updated_node = repository.update_node_status(node_id, target_status)
     if run.status == RunStatus.BLOCKED_HUMAN:
         repository.update_run_status(run_id, RunStatus.RUNNING)
-        event_stream.publish(
-            DomainEvent(
-                event_id=f"evt_{_default_id_factory()}",
-                run_id=run_id,
-                node_id=node_id,
-                type=DomainEventType.RUN_STATUS_CHANGED,
-                payload={"status": RunStatus.RUNNING.value},
-            )
-        )
+        event_stream.publish(_evt(DomainEventType.RUN_STATUS_CHANGED, {"status": RunStatus.RUNNING.value}))
 
-    event_stream.publish(
-        DomainEvent(
-            event_id=f"evt_{_default_id_factory()}",
-            run_id=run_id,
-            node_id=node_id,
-            type=DomainEventType.NODE_INTERVENTION_APPLIED,
-            payload={
-                "intervention_id": intervention_id,
-                "action": action.value,
-                "actor": resolved_actor,
-                "note": note,
-                "node_status": updated_node.status.value,
-                "payload_delta": payload_delta,
-            },
-        )
-    )
+    event_stream.publish(_evt(DomainEventType.NODE_INTERVENTION_APPLIED, {
+        "intervention_id": intervention_id, "action": action.value, "actor": resolved_actor,
+        "note": note, "node_status": updated_node.status.value, "payload_delta": payload_delta,
+    }))
 
     if target_status == NodeStatus.RUNNING:
+        with _active_runs_lock:
+            if run_id in _active_runs:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"run {run_id} is already executing",
+                )
+            _active_runs.add(run_id)
 
         def _resume_background() -> None:
             try:
                 orchestrator.resume_from_node(run_id=run_id, node_id=node_id)
             except Exception:
-                # Orchestrator emits terminal events on failure.
-                return
+                _log.warning("resume_from_node failed for run=%s node=%s", run_id, node_id, exc_info=True)
+            finally:
+                with _active_runs_lock:
+                    _active_runs.discard(run_id)
 
         _run_executor.submit(_resume_background)
 
@@ -593,8 +573,10 @@ def apply_intervention(
 
 
 __all__ = [
+    "_active",
     "get_event_stream",
     "get_orchestrator",
+    "get_run_executor",
     "get_run_repository",
     "provider_readiness",
     "reset_runs_services",

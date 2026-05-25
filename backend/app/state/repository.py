@@ -44,6 +44,14 @@ class RunStateRepository(ABC):
     def list_runs(self) -> list[RunState]:
         raise NotImplementedError
 
+    def list_runs_by_status(self, status: RunStatus) -> list[RunState]:
+        """Return all runs matching *status*. Default implementation filters list_runs()."""
+        return [r for r in self.list_runs() if r.status == status]
+
+    @abstractmethod
+    def increment_run_tokens(self, run_id: str, amount: int) -> RunState:
+        raise NotImplementedError
+
     @abstractmethod
     def create_node(self, node: NodeState) -> None:
         raise NotImplementedError

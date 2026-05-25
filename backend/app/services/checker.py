@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
-import json
 from typing import Any, Protocol
 
 from pydantic import TypeAdapter, ValidationError
 
 from app.adapters.llm_client import LLMClient, LLMGenerateRequest, LLMMessage
 from app.domain.models import NodeStatus
-from app.domain.policies import CheckerFailurePolicy, DEFAULT_CHECKER_FAILURE_POLICY
+from app.domain.policies import DEFAULT_CHECKER_FAILURE_POLICY, CheckerFailurePolicy
 from app.schemas.api import CheckerConfig
 from app.schemas.contracts import CheckerResult, CheckerVerdict
 
@@ -76,7 +76,7 @@ class LLMCheckerClient:
                     **request.metadata,
                 },
             )
-        )
+        ).data
 
 
 @dataclass(slots=True, frozen=True)
@@ -186,81 +186,33 @@ class CheckerService:
             )
 
         checker_result, attempts_used = self._run_with_validation_retries(
-            request=CheckerRequest(
-                scope=scope,
-                objective=objective,
-                output=output,
-                metadata=dict(metadata or {}),
-            )
-        )
+            CheckerRequest(scope=scope, objective=objective, output=output,
+                           metadata=dict(metadata or {})))
 
-        if checker_result.verdict == CheckerVerdict.PASS:
-            return CheckerOutcome(
-                invoked=True,
-                scope=scope,
-                result=checker_result,
-                consecutive_failures=0,
-                should_block_human=False,
-                next_node_status=NodeStatus.COMPLETED,
-                attempts_used=attempts_used,
-                events=(
-                    CheckerEvent(
-                        event_type="checker.completed",
-                        payload={
-                            "scope": scope.value,
-                            "verdict": checker_result.verdict.value,
-                            "reason": checker_result.reason,
-                            "suggested_fix": checker_result.suggested_fix,
-                            "confidence": checker_result.confidence,
-                            "violations": list(checker_result.violations),
-                            "consecutive_failures": 0,
-                        },
-                    ),
-                ),
-            )
+        is_pass = checker_result.verdict == CheckerVerdict.PASS
+        updated_failures = 0 if is_pass else consecutive_failures + 1
+        should_block = False if is_pass else self._failure_policy.should_block(updated_failures)
+        next_status = (NodeStatus.COMPLETED if is_pass
+                       else NodeStatus.BLOCKED_HUMAN if should_block else NodeStatus.FAILED_CHECK)
 
-        updated_failures = consecutive_failures + 1
-        should_block = self._failure_policy.should_block(updated_failures)
-        next_status = (
-            NodeStatus.BLOCKED_HUMAN if should_block else NodeStatus.FAILED_CHECK
-        )
-        events = [
-            CheckerEvent(
-                event_type="checker.completed",
-                payload={
-                    "scope": scope.value,
-                    "verdict": checker_result.verdict.value,
-                    "reason": checker_result.reason,
-                    "suggested_fix": checker_result.suggested_fix,
-                    "confidence": checker_result.confidence,
-                    "violations": list(checker_result.violations),
-                    "consecutive_failures": updated_failures,
-                },
-            )
-        ]
+        completed_evt = CheckerEvent("checker.completed", {
+            "scope": scope.value, "verdict": checker_result.verdict.value,
+            "reason": checker_result.reason, "suggested_fix": checker_result.suggested_fix,
+            "confidence": checker_result.confidence, "violations": list(checker_result.violations),
+            "consecutive_failures": updated_failures,
+        })
+        events: list[CheckerEvent] = [completed_evt]
         if should_block:
-            events.append(
-                CheckerEvent(
-                    event_type="node.blocked_human",
-                    payload={
-                        "scope": scope.value,
-                        "reason": "checker_failed_consecutive_threshold",
-                        "consecutive_failures": updated_failures,
-                        "threshold": self._failure_policy.block_after_consecutive_failures,
-                    },
-                )
-            )
+            events.append(CheckerEvent("node.blocked_human", {
+                "scope": scope.value, "reason": "checker_failed_consecutive_threshold",
+                "consecutive_failures": updated_failures,
+                "threshold": self._failure_policy.block_after_consecutive_failures,
+            }))
 
         return CheckerOutcome(
-            invoked=True,
-            scope=scope,
-            result=checker_result,
-            consecutive_failures=updated_failures,
-            should_block_human=should_block,
-            next_node_status=next_status,
-            attempts_used=attempts_used,
-            events=tuple(events),
-        )
+            invoked=True, scope=scope, result=checker_result,
+            consecutive_failures=updated_failures, should_block_human=should_block,
+            next_node_status=next_status, attempts_used=attempts_used, events=tuple(events))
 
     @staticmethod
     def should_run(*, checker_config: CheckerConfig, scope: CheckerScope) -> bool:

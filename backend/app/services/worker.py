@@ -1,8 +1,9 @@
 """LLM-powered base-case worker: executes multi-step work plans via persona-aware LLM calls."""
 from __future__ import annotations
 
-import json
 import importlib.util
+import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.domain.models import NodeContext
 from app.services.persona_registry import PersonaProfile, PersonaRegistry
 
 EventEmitter = Callable[[str, str, DomainEventType, dict[str, object]], None]
+_log = logging.getLogger(__name__)
 
 
 class WorkerSchemaError(RuntimeError):
@@ -48,7 +50,7 @@ class LLMBaseCaseWorker:
 
     def execute(self, *, run_id: str, node_id: str, objective: str, depth: int,
                 persona_id: str | None, work_plan: list[dict[str, Any]],
-                node_context: NodeContext | None = None) -> Any:
+                node_context: NodeContext | None = None, model: str | None = None) -> Any:
         from app.services.executor import WorkExecutionResult
 
         profile = self._registry.get_profile(persona_id) if persona_id else None
@@ -66,7 +68,7 @@ class LLMBaseCaseWorker:
 
             try:
                 out = self._call_step(sys_prompt, objective, desc, si, total, depth,
-                                      _sliding_context(ctx, objective), profile, node_context)
+                                      _sliding_context(ctx), profile, node_context, model=model)
             except Exception as err:
                 out = self._self_heal(sys_prompt, objective, desc, si, total, depth, ctx, profile, str(err))
                 if out is None:
@@ -109,7 +111,7 @@ class LLMBaseCaseWorker:
 
     def _call_step(self, sys_prompt: str, objective: str, desc: str, si: int, total: int,
                    depth: int, prior: str, profile: PersonaProfile | None,
-                   node_ctx: NodeContext | None = None) -> Any:
+                   node_ctx: NodeContext | None = None, *, model: str | None = None) -> Any:
         lineage = f"\n\n{node_ctx.to_prompt_block()}" if node_ctx else ""
         ctx_block = f"\n\nPrior progress:\n{prior}" if prior else ""
         name = profile.name if profile else "General Agent"
@@ -121,10 +123,10 @@ class LLMBaseCaseWorker:
         temp = profile.model.temperature if profile and profile.model.temperature is not None else self._temp
         resp = self._llm.generate_json(LLMGenerateRequest(
             messages=[LLMMessage(role="system", content=sys_prompt), LLMMessage(role="user", content=user_prompt)],
-            temperature=temp,
+            temperature=temp, model=model,
             metadata={"service": "worker", "step": str(si), "total_steps": str(total),
                       "persona": profile.persona_id if profile else "none"},
-        ))
+        )).data
         if profile:
             resp = _run_hook(profile, "post", resp)
         return resp
@@ -132,10 +134,17 @@ class LLMBaseCaseWorker:
     def _self_heal(self, sys_prompt: str, objective: str, desc: str, si: int, total: int,
                    depth: int, ctx: list[str], profile: PersonaProfile | None, error: str) -> Any:
         try:
-            heal_ctx = _sliding_context(ctx, objective)
+            heal_ctx = _sliding_context(ctx)
             heal_ctx += f"\nPREVIOUS ATTEMPT FAILED: {error}. Fix the issue and try a different approach."
             return self._call_step(sys_prompt, objective, f"[RETRY] {desc}", si, total, depth, heal_ctx, profile)
-        except Exception:
+        except Exception as exc:
+            _log.warning(
+                "self-heal failed for step %d/%d (persona=%s): %s",
+                si, total,
+                profile.persona_id if profile else "none",
+                exc,
+                exc_info=True,
+            )
             return None
 
     def _emit(self, run_id: str, node_id: str, evt: DomainEventType, payload: dict[str, object]) -> None:
@@ -145,13 +154,17 @@ class LLMBaseCaseWorker:
 
 # ---- pure functions (no self) ----
 
-def _sliding_context(steps: list[str], objective: str) -> str:
+def _sliding_context(steps: list[str]) -> str:
     if not steps:
         return ""
     if len(steps) == 1:
         return steps[0]
-    summary = [s.split(": ", 1)[0] for s in steps[:-1]]
-    return f"Completed: {'; '.join(summary)}\nLast step detail: {steps[-1]}"
+    summary = []
+    for s in steps[:-1]:
+        label, _, output = s.partition(": ")
+        snippet = (output[:120] + "...") if len(output) > 120 else output
+        summary.append(f"{label}: {snippet}" if output else label)
+    return "Previous steps:\n" + "\n".join(summary) + f"\nCurrent step detail:\n{steps[-1]}"
 
 
 def _examples_block(examples: tuple[dict[str, Any], ...]) -> str:
@@ -186,7 +199,7 @@ def _run_hook(profile: PersonaProfile, hook_type: str, data: Any) -> Any:
         if callable(fn):
             return fn(data)
     except Exception:
-        pass
+        _log.warning("hook %s failed for persona=%s", hook_type, profile.persona_id, exc_info=True)
     return data
 
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from app.domain.models import NodeStatus
 from app.schemas.api import CheckerConfig, RunConfig
-from app.schemas.contracts import CheckerResult, DividerDecision
+from app.schemas.contracts import DividerDecision
 from app.services.checker import CheckerRequest, CheckerService
 from app.services.divider import (
     BaseCaseWorkPlan,

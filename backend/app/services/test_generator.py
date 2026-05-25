@@ -46,6 +46,8 @@ class GeneratedTests:
 
 
 class TestGeneratorService:
+    __test__ = False  # prevent pytest collection
+
     def __init__(self, llm: LLMClient, *, temperature: float = 0.3,
                  persona: PersonaProfile | None = None):
         self._llm = llm
@@ -73,7 +75,7 @@ class TestGeneratorService:
             temperature=self._temp,
             metadata={"service": "test_generator"},
         )
-        raw = self._llm.generate_json(req)
+        raw = self._llm.generate_json(req).data
         return self._parse(raw)
 
     @staticmethod

@@ -8,25 +8,32 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.responses import StreamingResponse
 
 from app.services.event_stream import EventStreamService
-from app.state.memory_repo import InMemoryRunStateRepository
 
 router = APIRouter(prefix="/api/runs", tags=["events"])
 
-_default_repository = InMemoryRunStateRepository()
-_event_stream_service: EventStreamService = EventStreamService(
-    repository=_default_repository
-)
+# Module-level override for test wiring (set by set_runs_services via set_event_stream_service)
+_event_stream_service: EventStreamService | None = None
 
 
-def set_event_stream_service(service: EventStreamService) -> None:
+def set_event_stream_service(service: EventStreamService | None) -> None:
     """Override event stream service instance (used by integration wiring/tests)."""
     global _event_stream_service
     _event_stream_service = service
 
 
-def get_event_stream_service() -> EventStreamService:
+def get_event_stream_service(request: Request) -> EventStreamService:
     """FastAPI dependency accessor for event stream service."""
-    return _event_stream_service
+    # Override takes precedence (for tests)
+    if _event_stream_service is not None:
+        return _event_stream_service
+    # Production: read from app.state
+    stream = getattr(request.app.state, "event_stream", None)
+    if stream is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Event stream service not initialized",
+        )
+    return stream
 
 
 def _resolve_after_seq(*, after_seq: int | None, last_event_id: str | None) -> int:

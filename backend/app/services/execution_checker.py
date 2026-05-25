@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.adapters.llm_client import LLMClient
-from app.sandbox.executor import SuiteResult, create_sandbox, detect_language
+from app.sandbox.executor import SandboxExecutor, SuiteResult, create_sandbox, detect_language
 from app.services.checker import CheckerRequest, LLMCheckerClient
 from app.services.test_generator import TestGeneratorService
 
@@ -56,7 +56,7 @@ class ExecutionCheckerClient:
         # stdin/stdout tests
         lang = _extract_language(request.output, code)
         suite = self._sandbox.run_tests(code, gen.cases, language=lang)
-        return _suite_to_checker_result(suite, request.objective)
+        return _suite_to_checker_result(suite)
 
 
 def _extract_code(output: Any) -> str | None:
@@ -110,7 +110,7 @@ def _extract_test_hints(output: Any) -> list[str]:
     return []
 
 
-def _suite_to_checker_result(suite: SuiteResult, objective: str) -> dict[str, Any]:
+def _suite_to_checker_result(suite: SuiteResult) -> dict[str, Any]:
     """Convert SuiteResult to checker-compatible JSON payload."""
     if suite.compile_error:
         return {

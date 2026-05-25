@@ -26,6 +26,12 @@ class WorkspaceConfig(BaseModel):
     output_dir: str | None = None  # resolved at runtime if None
 
 
+class TokenBudget(BaseModel):
+    max_total_tokens: int = Field(default=500_000, ge=1000)
+    max_tokens_per_node: int = Field(default=50_000, ge=1000)
+    on_exhausted: Literal["fail", "warn"] = "fail"
+
+
 class RunConfig(BaseModel):
     checker: CheckerConfig = Field(default_factory=CheckerConfig)
     max_depth: int = Field(default=8, ge=1)
@@ -33,6 +39,9 @@ class RunConfig(BaseModel):
     decomposition_candidates: int = Field(default=3, ge=1, le=10)
     re_decompose_after: int = Field(default=2, ge=1)
     complexity_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    adaptive_depth: bool = False
+    persona_chain: list[str] | None = None
+    token_budget: TokenBudget = Field(default_factory=TokenBudget)
     stream: StreamConfig = Field(default_factory=StreamConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
 
@@ -156,5 +165,6 @@ __all__ = [
     "RunView",
     "SkipWithJustificationIntervention",
     "StreamConfig",
+    "TokenBudget",
     "WorkspaceConfig",
 ]

@@ -1,11 +1,12 @@
 """Tests for _extract_json_from_text and _load_json_text fallback."""
 
+import pytest
+
 from app.adapters.llm_client import (
     LLMClientRuntimeError,
     _extract_json_from_text,
     _load_json_text,
 )
-import pytest
 
 
 class TestExtractJsonFromText:

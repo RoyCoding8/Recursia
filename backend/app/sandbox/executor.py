@@ -45,6 +45,7 @@ class TestCase:
     input: str
     expected: str
     timeout_s: float = 10.0
+    __test__ = False  # prevent pytest collection
 
 
 @dataclass(slots=True, frozen=True)
@@ -55,6 +56,7 @@ class TestResult:
     expected: str
     exec_result: ExecResult
     error: str | None = None
+    __test__ = False  # prevent pytest collection
 
 
 @dataclass(slots=True, frozen=True)
@@ -140,14 +142,13 @@ class SubprocessBackend:
         workdir = tempfile.mkdtemp(prefix="recursia_sandbox_")
         try:
             src = self._write_source(workdir, code, lang)
-            max_t = max((t for _, t in cases), default=30.0)
-            comp = self._compile(workdir, src, lang, max_t)
+            comp = self._compile(workdir, src, lang, max((t for _, t in cases), default=30.0))
             if comp and not comp.ok:
                 err = ExecResult(stdout="", stderr=f"COMPILE ERROR:\n{comp.stderr}",
                                  exit_code=comp.exit_code, timed_out=comp.timed_out,
                                  duration_ms=comp.duration_ms)
                 return [err] * len(cases)
-            return [self._run(workdir, src, lang, sin, t) for sin, t in cases]
+            return [self._run(workdir, src, lang, s, t) for s, t in cases]
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -226,25 +227,97 @@ class EpicboxBackend:
         profile, _, cmd = self._PROFILES[lang]
         ext = _LANG_CONFIG[lang][0]
         fname = "Main.java" if lang == Language.JAVA else f"solution{ext}"
-        files = [{"name": fname, "content": code.encode("utf-8")}]
         limits = {"cputime": max(int(timeout_s), 1), "memory": self._mem,
                   "realtime": max(int(timeout_s * 2), 2)}
         start = time.monotonic()
-        result = epicbox.run(profile, cmd, files=files,
-                             stdin=stdin.encode("utf-8") if stdin else None,
-                             limits=limits)
+        result = epicbox.run(profile, cmd,
+                             files=[{"name": fname, "content": code.encode()}],
+                             stdin=stdin.encode() if stdin else None, limits=limits)
         elapsed = int((time.monotonic() - start) * 1000)
         return ExecResult(
             stdout=result["stdout"].decode("utf-8", errors="replace")[:self._max_out],
             stderr=result["stderr"].decode("utf-8", errors="replace")[:self._max_out],
             exit_code=result["exit_code"],
-            timed_out=result.get("timeout", False),
-            duration_ms=elapsed,
-        )
+            timed_out=result.get("timeout", False), duration_ms=elapsed)
 
     def run_batch(self, code: str, lang: Language,
                   cases: Sequence[tuple[str, float]]) -> list[ExecResult]:
-        return [self.run_code(code, lang, stdin=s, timeout_s=t) for s, t in cases]
+        if not cases:
+            return []
+        # Build a single-harness script that runs all cases in one container,
+        # separating outputs with a unique delimiter.
+        delimiter = "---RECURSIA_CASE_SEP---"
+        ext = _LANG_CONFIG[lang][0]
+        fname = "Main.java" if lang == Language.JAVA else f"solution{ext}"
+        harness = self._build_harness(lang, fname, cases, delimiter)
+        harness_files = [{"name": fname, "content": code.encode("utf-8")},
+                         {"name": "harness.sh", "content": harness.encode("utf-8")}]
+        total_timeout = max(t for _, t in cases) * len(cases) + 30
+        limits = {"cputime": max(int(total_timeout), 1), "memory": self._mem,
+                  "realtime": max(int(total_timeout * 2), 2)}
+        import epicbox  # type: ignore[import-untyped]
+        self._ensure_configured()
+        profile_name = self._PROFILES[lang][0]
+        start = time.monotonic()
+        result = epicbox.run(profile_name, "sh harness.sh", files=harness_files, limits=limits)
+        elapsed = int((time.monotonic() - start) * 1000)
+        stdout = result["stdout"].decode("utf-8", errors="replace")
+        if result["exit_code"] != 0 and delimiter not in stdout:
+            # Compile error or harness failure — apply to all cases
+            err = ExecResult(
+                stdout="", stderr=stdout[:self._max_out],
+                exit_code=result["exit_code"],
+                timed_out=result.get("timeout", False), duration_ms=elapsed,
+            )
+            return [err] * len(cases)
+        return self._split_harness_output(stdout, delimiter, len(cases), elapsed,
+                                          result.get("timeout", False), result["exit_code"])
+
+    @staticmethod
+    def _build_harness(lang: Language, fname: str,
+                       cases: Sequence[tuple[str, float]], delimiter: str) -> str:
+        """Generate a shell script that compiles once and runs all test cases."""
+        import base64
+        compile_tpl = _LANG_CONFIG[lang][1]
+        run_tpl = _LANG_CONFIG[lang][2]
+        lines: list[str] = []
+        if compile_tpl:
+            compile_cmd = compile_tpl.format(file=fname, binary="solution", dir=".")
+            lines.append(compile_cmd)
+            lines.append("compile_exit=$?")
+            lines.append('if [ "$compile_exit" -ne 0 ]; then exit "$compile_exit"; fi')
+        for i, (stdin, _timeout) in enumerate(cases):
+            run_cmd = run_tpl.format(file=fname, binary="solution", dir=".")
+            lines.append(f'echo "{delimiter} CASE {i}"')
+            if stdin:
+                b64 = base64.b64encode(stdin.encode("utf-8")).decode("ascii")
+                lines.append(f'echo "{b64}" | base64 -d | {run_cmd}')
+            else:
+                lines.append(run_cmd)
+            lines.append(f'echo "{delimiter} CASE_DONE {i}"')
+        return "\n".join(lines) + "\n"
+
+    def _split_harness_output(self, stdout: str, delimiter: str, n: int,
+                              elapsed: int, timed_out: bool,
+                              exit_code: int) -> list[ExecResult]:
+        """Split combined harness stdout into per-case ExecResults."""
+        import re
+        # Each case is delimited by "CASE N" ... "CASE_DONE N" pairs
+        case_pattern = re.compile(
+            rf'{re.escape(delimiter)} CASE (\d+)\n(.*?){re.escape(delimiter)} CASE_DONE \1',
+            re.DOTALL,
+        )
+        matches = {int(m.group(1)): m.group(2) for m in case_pattern.finditer(stdout)}
+        per_case_ms = max(elapsed // max(n, 1), 1)
+        results: list[ExecResult] = []
+        for i in range(n):
+            case_stdout = matches.get(i, "")
+            results.append(ExecResult(
+                stdout=case_stdout[:self._max_out], stderr="",
+                exit_code=exit_code, timed_out=timed_out,
+                duration_ms=per_case_ms,
+            ))
+        return results
 
 
 # ---------------------------------------------------------------------------

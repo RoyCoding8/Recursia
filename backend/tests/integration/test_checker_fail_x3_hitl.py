@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-import os
 
 from fastapi.testclient import TestClient
 
@@ -33,13 +32,30 @@ _id_factory.counter = 0
 def _wire_events_only_services() -> tuple[
     InMemoryRunStateRepository, EventStreamService
 ]:
-    from app.api.runs import _build_runtime_orchestrator, set_runs_services
+    from app.api.runs import set_runs_services
+    from app.services.executor import RecursiveExecutor
+    from app.services.orchestrator import Orchestrator
+    from app.services.stubs import DeterministicDivider, DeterministicPersonaRouter
 
     _id_factory.counter = 0
     repo = InMemoryRunStateRepository()
     event_stream = EventStreamService(repository=repo)
-    os.environ["LLM_PROVIDER"] = "stub"
-    orchestrator = _build_runtime_orchestrator(repository=repo)
+
+    def _emit(run_id, node_id, event_type, payload):
+        event_stream.publish(DomainEvent(
+            event_id=f"evt_{_id_factory()}", run_id=run_id,
+            node_id=node_id, type=event_type, payload=payload,
+        ))
+
+    executor = RecursiveExecutor(
+        repository=repo,
+        divider=DeterministicDivider(),
+        persona_router=DeterministicPersonaRouter(),
+        event_emitter=_emit,
+    )
+    orchestrator = Orchestrator(
+        repository=repo, executor=executor, event_stream=event_stream,
+    )
     set_runs_services(
         repository=repo, orchestrator=orchestrator, event_stream=event_stream
     )

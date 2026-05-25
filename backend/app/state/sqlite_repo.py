@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,7 @@ class SQLiteRunStateRepository(RunStateRepository):
         self._schema_path = (
             Path(schema_path) if schema_path else self._default_schema_path()
         )
+        self._event_lock = threading.Lock()
         self._conn = sqlite3.connect(self._db_path)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -66,16 +68,18 @@ class SQLiteRunStateRepository(RunStateRepository):
                     objective,
                     status,
                     config_json,
+                    tokens_used,
                     created_at,
                     updated_at,
                     completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.run_id,
                     run.objective,
                     run.status.value,
                     self._to_json(run.config.model_dump(mode="json")),
+                    run.tokens_used,
                     self._dt(run.created_at),
                     self._dt(run.updated_at),
                     self._dt_or_none(run.completed_at),
@@ -125,6 +129,16 @@ class SQLiteRunStateRepository(RunStateRepository):
             "SELECT * FROM runs ORDER BY created_at, run_id"
         ).fetchall()
         return [self._row_to_run(row) for row in rows]
+
+    def increment_run_tokens(self, run_id: str, amount: int) -> RunState:
+        run = self.get_run(run_id)
+        new_total = run.tokens_used + amount
+        self._conn.execute(
+            "UPDATE runs SET tokens_used = ?, updated_at = ? WHERE run_id = ?",
+            (new_total, self._dt(utc_now()), run_id),
+        )
+        self._conn.commit()
+        return replace(run, tokens_used=new_total, updated_at=utc_now())
 
     def create_node(self, node: NodeState) -> None:
         _ = self.get_run(node.run_id)
@@ -198,63 +212,40 @@ class SQLiteRunStateRepository(RunStateRepository):
         ).fetchall()
         return [self._row_to_node(row) for row in rows]
 
+    def _update_node(self, node_id: str, **kwargs: Any) -> NodeState:
+        """Fetch node, apply dataclass field overrides, persist, return."""
+        node = self.get_node(node_id)
+        updated = replace(node, updated_at=utc_now(), **kwargs)
+        self._persist_node(updated)
+        return updated
+
     def update_node_status(self, node_id: str, status: NodeStatus) -> NodeState:
         node = self.get_node(node_id)
         ensure_node_transition(node.status, status)
-        updated = replace(node, status=status, updated_at=utc_now())
-        self._persist_node(updated)
-        return updated
+        return self._update_node(node_id, status=status)
 
     def update_node_objective(self, node_id: str, objective: str) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, objective=objective, updated_at=utc_now())
-        self._persist_node(updated)
-        return updated
+        return self._update_node(node_id, objective=objective)
 
     def update_node_persona(self, node_id: str, persona_id: str | None) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, persona_id=persona_id, updated_at=utc_now())
-        self._persist_node(updated)
-        return updated
+        return self._update_node(node_id, persona_id=persona_id)
 
     def update_node_kind(self, node_id: str, node_kind: NodeKind) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, node_kind=node_kind, updated_at=utc_now())
-        self._persist_node(updated)
-        return updated
+        return self._update_node(node_id, node_kind=node_kind)
 
-    def update_node_checker_policy(self, node_id: str, policy: "CheckerConfig") -> NodeState:
-        from app.schemas.api import CheckerConfig as _CC
-        node = self.get_node(node_id)
-        updated = replace(node, checker_policy=policy, updated_at=utc_now())
-        self._persist_node(updated)
-        return updated
+    def update_node_checker_policy(self, node_id: str, policy: CheckerConfig) -> NodeState:
+        return self._update_node(node_id, checker_policy=policy)
 
     def increment_node_attempt_count(self, node_id: str) -> NodeState:
         node = self.get_node(node_id)
-        updated = replace(
-            node,
-            attempt_count=node.attempt_count + 1,
-            updated_at=utc_now(),
-        )
-        self._persist_node(updated)
-        return updated
+        return self._update_node(node_id, attempt_count=node.attempt_count + 1)
 
     def reset_checker_failures(self, node_id: str) -> NodeState:
-        node = self.get_node(node_id)
-        updated = replace(node, consecutive_checker_failures=0, updated_at=utc_now())
-        self._persist_node(updated)
-        return updated
+        return self._update_node(node_id, consecutive_checker_failures=0)
 
     def increment_checker_failures(self, node_id: str) -> NodeState:
         node = self.get_node(node_id)
-        updated = replace(
-            node,
-            consecutive_checker_failures=node.consecutive_checker_failures + 1,
-            updated_at=utc_now(),
-        )
-        self._persist_node(updated)
-        return updated
+        return self._update_node(node_id, consecutive_checker_failures=node.consecutive_checker_failures + 1)
 
     def record_node_started(self, node_id: str) -> NodeState:
         node = self.get_node(node_id)
@@ -421,40 +412,41 @@ class SQLiteRunStateRepository(RunStateRepository):
     def append_event(self, event: DomainEvent) -> DomainEvent:
         _ = self.get_run(event.run_id)
         ts = event.ts or utc_now()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            next_seq = self._conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE run_id = ?",
-                (event.run_id,),
-            ).fetchone()[0]
-            stored = replace(event, seq=next_seq, ts=ts)
-            self._conn.execute(
-                """
-                INSERT INTO events (
-                    event_id,
-                    run_id,
-                    node_id,
-                    seq,
-                    type,
-                    payload_json,
-                    ts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    stored.event_id,
-                    stored.run_id,
-                    stored.node_id,
-                    stored.seq,
-                    stored.type.value,
-                    self._to_json(stored.payload),
-                    self._dt(stored.ts),
-                ),
-            )
-            self._conn.commit()
-            return stored
-        except Exception:
-            self._conn.rollback()
-            raise
+        with self._event_lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                next_seq = self._conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE run_id = ?",
+                    (event.run_id,),
+                ).fetchone()[0]
+                stored = replace(event, seq=next_seq, ts=ts)
+                self._conn.execute(
+                    """
+                    INSERT INTO events (
+                        event_id,
+                        run_id,
+                        node_id,
+                        seq,
+                        type,
+                        payload_json,
+                        ts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        stored.event_id,
+                        stored.run_id,
+                        stored.node_id,
+                        stored.seq,
+                        stored.type.value,
+                        self._to_json(stored.payload),
+                        self._dt(stored.ts),
+                    ),
+                )
+                self._conn.commit()
+                return stored
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def list_run_events(self, run_id: str, after_seq: int = 0) -> list[DomainEvent]:
         _ = self.get_run(run_id)
@@ -560,6 +552,7 @@ class SQLiteRunStateRepository(RunStateRepository):
             objective=row["objective"],
             status=RunStatus(row["status"]),
             config=RunConfig.model_validate(self._from_json(row["config_json"])),
+            tokens_used=int(row["tokens_used"]) if row["tokens_used"] else 0,
             created_at=self._parse_dt(row["created_at"]) or utc_now(),
             updated_at=self._parse_dt(row["updated_at"]) or utc_now(),
             completed_at=self._parse_dt(row["completed_at"]),

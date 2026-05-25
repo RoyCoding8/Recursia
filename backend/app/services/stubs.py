@@ -14,7 +14,7 @@ class DeterministicDivider:
     """Explicit deterministic divider for dev/test fallback wiring."""
 
     def divide(self, objective: str, depth: int = 0,
-               node_context: NodeContext | None = None) -> DividerServiceResult:
+               node_context: NodeContext | None = None, **_kwargs) -> DividerServiceResult:
         return DividerServiceResult(
             decision=DividerDecision.BASE_CASE,
             base_case=BaseCaseWorkPlan(
@@ -56,6 +56,7 @@ class DeterministicBaseCaseWorker:
         persona_id: str | None,
         work_plan: list[dict[str, Any]],
         node_context: NodeContext | None = None,
+        model: str | None = None,
     ) -> Any:
         from app.services.executor import WorkExecutionResult
 

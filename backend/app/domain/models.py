@@ -27,6 +27,7 @@ class NodeContext:
     completed_sibling_summaries: tuple[str, ...] = ()
     boundary_constraints: tuple[str, ...] = ()
     checker_feedback: str | None = None
+    prior_persona_output: str | None = None
 
     def child(self, objective: str, siblings: list[str] | None = None,
               constraints: list[str] | None = None) -> NodeContext:
@@ -35,6 +36,8 @@ class NodeContext:
             parent_chain=(*self.parent_chain, objective),
             sibling_objectives=tuple(siblings or ()),
             boundary_constraints=tuple(constraints or ()),
+            checker_feedback=self.checker_feedback,
+            prior_persona_output=self.prior_persona_output,
         )
 
     def with_sibling_output(self, summary: str) -> NodeContext:
@@ -45,6 +48,18 @@ class NodeContext:
             completed_sibling_summaries=(*self.completed_sibling_summaries, summary),
             boundary_constraints=self.boundary_constraints,
             checker_feedback=self.checker_feedback,
+            prior_persona_output=self.prior_persona_output,
+        )
+
+    def with_prior_output(self, output: str) -> NodeContext:
+        return NodeContext(
+            root_objective=self.root_objective,
+            parent_chain=self.parent_chain,
+            sibling_objectives=self.sibling_objectives,
+            completed_sibling_summaries=self.completed_sibling_summaries,
+            boundary_constraints=self.boundary_constraints,
+            checker_feedback=self.checker_feedback,
+            prior_persona_output=output,
         )
 
     def with_checker_feedback(self, fix: str, violations: list[str]) -> NodeContext:
@@ -58,6 +73,7 @@ class NodeContext:
             completed_sibling_summaries=self.completed_sibling_summaries,
             boundary_constraints=self.boundary_constraints,
             checker_feedback=feedback,
+            prior_persona_output=self.prior_persona_output,
         )
 
     def to_prompt_block(self) -> str:
@@ -73,6 +89,8 @@ class NodeContext:
             parts.append("Constraints: " + "; ".join(self.boundary_constraints))
         if self.checker_feedback:
             parts.append(f"⚠ CHECKER FEEDBACK (fix this):\n{self.checker_feedback}")
+        if self.prior_persona_output:
+            parts.append(f"Prior persona output (refine this):\n{self.prior_persona_output}")
         return "\n".join(parts)
 
 
@@ -82,6 +100,7 @@ class RunState:
     objective: str
     config: RunConfig = field(default_factory=RunConfig)
     status: RunStatus = RunStatus.QUEUED
+    tokens_used: int = 0
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     completed_at: datetime | None = None

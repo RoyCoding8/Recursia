@@ -9,6 +9,7 @@ const SSE_EVENT_TYPES = [
   "node.status_changed",
   "node.token",
   "node.ttft_recorded",
+  "node.subtree_pruned",
   "checker.started",
   "checker.completed",
   "merge.started",
@@ -19,6 +20,7 @@ const SSE_EVENT_TYPES = [
   "work.step_completed",
   "run.completed",
   "run.failed",
+  "token.usage_recorded",
 ] as const;
 
 export interface SseClientOptions {

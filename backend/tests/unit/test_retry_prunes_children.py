@@ -10,26 +10,20 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-import pytest
-
 from app.domain.events import DomainEventType
 from app.domain.models import NodeContext, NodeKind, NodeState, NodeStatus, RunState
-from app.schemas.api import CheckerConfig, RunConfig
 from app.schemas.contracts import DividerDecision
 from app.services.divider import (
     DividerServiceResult,
-    RecursiveDecomposition,
     RecursiveChildSpec,
+    RecursiveDecomposition,
 )
 from app.services.executor import (
     ExecutionTerminal,
-    NodeExecutionResult,
     RecursiveExecutor,
-    WorkExecutionResult,
 )
 from app.services.stubs import DeterministicBaseCaseWorker, DeterministicPersonaRouter
 from app.state.memory_repo import InMemoryRunStateRepository
-
 
 # ---------------------------------------------------------------------------
 # Helpers

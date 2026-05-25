@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { GraphCanvas } from "@/components/GraphCanvas";
 import { NodeDetailsDrawer } from "@/components/NodeDetailsDrawer";
 import { ProposedFilesPanel } from "@/components/ProposedFilesPanel";
@@ -14,28 +15,16 @@ import { apiClient, ApiError } from "@/lib/api";
 import { DEFAULT_BASE_URL } from "@/lib/config";
 import type { DirectoryHandleLike } from "@/lib/directoryReview";
 import { runEventsClient, type SseSubscription } from "@/lib/events";
-import { runStore } from "@/state/runStore";
-import type { PersonaSummary, RunResultResponse, RunStatus } from "@/types/contracts";
+import { isTerminalStatus } from "@/lib/formatUtils";
+import { runStore, useRunStore } from "@/state/runStore";
+import type { PersonaSummary, RunResultResponse } from "@/types/contracts";
 
 interface DirectoryPickerWindow extends Window {
   showDirectoryPicker?: () => Promise<DirectoryHandleLike>;
 }
 
-function isTerminalRunStatus(status: RunStatus): boolean {
-  return (
-    status === "completed" ||
-    status === "failed" ||
-    status === "canceled" ||
-    status === "cancelled"
-  );
-}
-
 export default function MissionControlPage() {
-  const state = useSyncExternalStore(
-    runStore.subscribe.bind(runStore),
-    runStore.getState.bind(runStore),
-    runStore.getState.bind(runStore),
-  );
+  const state = useRunStore();
   const [selectedNodeId, setSelectedNodeId] = useState<string | undefined>(undefined);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -107,7 +96,7 @@ export default function MissionControlPage() {
   const nodes = useMemo(() => Object.values(state.nodesById), [state.nodesById]);
   const selectedNode = selectedNodeId ? state.nodesById[selectedNodeId] : undefined;
   const terminalReason = useMemo(() => {
-    if (!state.run || !isTerminalRunStatus(state.run.status)) {
+    if (!state.run || !isTerminalStatus(state.run.status)) {
       return undefined;
     }
 
@@ -115,13 +104,13 @@ export default function MissionControlPage() {
       return runResult.error;
     }
 
-    const failEvent = [...state.eventLog]
-      .reverse()
-      .find((event) => event.type === "run.failed") as
-      | { payload?: { error?: unknown } }
-      | undefined;
-
-    const payloadError = failEvent?.payload?.error;
+    let payloadError: unknown;
+    for (let i = state.eventLog.length - 1; i >= 0; i--) {
+      if (state.eventLog[i].type === "run.failed") {
+        payloadError = (state.eventLog[i] as { payload?: { error?: unknown } }).payload?.error;
+        break;
+      }
+    }
     if (typeof payloadError === "string" && payloadError.trim().length > 0) {
       return payloadError;
     }
@@ -152,7 +141,7 @@ export default function MissionControlPage() {
 
   useEffect(() => {
     const run = state.run;
-    if (!run || !isTerminalRunStatus(run.status)) {
+    if (!run || !isTerminalStatus(run.status)) {
       setIsRunResultLoading(false);
       return;
     }
@@ -296,6 +285,7 @@ export default function MissionControlPage() {
   }, []);
 
   return (
+    <ErrorBoundary>
     <main className="missionControlPage">
       <header className="hero">
         <div className="heroTopRow">
@@ -376,5 +366,6 @@ export default function MissionControlPage() {
         />
       </div>
     </main>
+    </ErrorBoundary>
   );
 }

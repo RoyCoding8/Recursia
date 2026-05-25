@@ -68,8 +68,7 @@ class DividerServiceResult:
 # Decomposition quality scoring (pure function, no LLM)
 # ---------------------------------------------------------------------------
 
-def score_decomposition(parsed: DividerBaseCase | DividerRecursiveCase,
-                        objective: str) -> float:
+def score_decomposition(parsed: DividerBaseCase | DividerRecursiveCase) -> float:
     """Score a decomposition candidate. Higher = better. Range ~0.0-1.0."""
     score = 0.5  # baseline
 
@@ -115,7 +114,6 @@ def score_decomposition(parsed: DividerBaseCase | DividerRecursiveCase,
         score -= (1.0 - unique_ratio) * 0.3
 
     # Check dependency DAG validity (no self-refs, basic sanity)
-    all_objectives = set(objectives)
     for c in children:
         for dep in c.dependencies:
             if dep.lower().strip() == c.objective.lower().strip():
@@ -175,7 +173,7 @@ class DividerService:
                     objective=objective, depth=depth, attempt=attempt,
                     node_context=node_context, complexity=complexity,
                 )
-            )
+            ).data
             try:
                 parsed = self._DIVIDER_RESULT_ADAPTER.validate_python(payload)
             except ValidationError as exc:
@@ -206,12 +204,12 @@ class DividerService:
                         node_context=node_context, complexity=complexity,
                         temperature_override=max(self._temperature, 0.4),
                     )
-                )
+                ).data
                 try:
                     parsed = self._DIVIDER_RESULT_ADAPTER.validate_python(payload)
                 except ValidationError:
                     continue
-                sc = score_decomposition(parsed, objective)
+                sc = score_decomposition(parsed)
                 candidates.append((sc, parsed, total_attempts))
                 break  # got valid candidate, next
 
@@ -237,107 +235,55 @@ class DividerService:
     def _build_request(self, *, objective: str, depth: int, attempt: int,
                        node_context: NodeContext | None = None,
                        complexity: ComplexityEstimate | None = None,
-                       temperature_override: float | None = None,
-                       ) -> LLMGenerateRequest:
-        repair_hint = ""
-        if attempt > 1:
-            repair_hint = (
-                " Previous output was invalid. "
-                "Respond with schema-valid JSON only (no markdown/code fences)."
-            )
-
-        lineage = ""
+                       temperature_override: float | None = None) -> LLMGenerateRequest:
+        parts = [
+            "Decide: BASE_CASE (single linear work plan) or RECURSIVE_CASE (decompose into 2+ sub-objectives)?",
+            "BASE_CASE: decision, rationale, work_plan (step+description), suggested_persona, needs_qa.",
+            "RECURSIVE_CASE: decision, rationale, children (objective, dependencies, suggested_persona, interface_contract, needs_qa).",
+            f"Objective: {objective}", f"Depth: {depth}.",
+        ]
         if node_context:
-            lineage = f"\n\nContext:\n{node_context.to_prompt_block()}"
-
-        complexity_hint = ""
+            parts.append(f"Context:\n{node_context.to_prompt_block()}")
         if complexity:
-            complexity_hint = (
-                f"\n\nComplexity assessment: {complexity.reasoning}. "
-                f"Suggested max depth: {complexity.suggested_depth}."
-            )
-
-        prompt = (
-            "Decide: is this a BASE_CASE (single linear work plan) or "
-            "RECURSIVE_CASE (decompose into 2+ sub-objectives)?\n\n"
-            "BASE_CASE requires: decision, rationale, work_plan (step+description), "
-            "suggested_persona, needs_qa.\n"
-            "RECURSIVE_CASE requires: decision, rationale, children (objective, "
-            "dependencies, suggested_persona, interface_contract, needs_qa).\n\n"
-            f"Objective: {objective}\n"
-            f"Depth: {depth}."
-            f"{lineage}"
-            f"{complexity_hint}"
-            f"{repair_hint}"
-        )
+            parts.append(f"Complexity: {complexity.reasoning}. Suggested max depth: {complexity.suggested_depth}.")
+        if attempt > 1:
+            parts.append("Previous output invalid. Respond with schema-valid JSON only (no fences).")
 
         return LLMGenerateRequest(
             messages=[
-                LLMMessage(
-                    role="system",
-                    content="Return strict JSON for divider contract. "
-                    'decision MUST be "BASE_CASE" or "RECURSIVE_CASE". '
-                    "work_plan steps are integers starting at 1.",
-                ),
-                LLMMessage(role="user", content=prompt),
+                LLMMessage(role="system", content='Return strict JSON. decision MUST be "BASE_CASE" or "RECURSIVE_CASE". work_plan steps are integers starting at 1.'),
+                LLMMessage(role="user", content="\n\n".join(parts)),
             ],
             temperature=temperature_override if temperature_override is not None else self._temperature,
-            metadata={
-                "service": "divider",
-                "attempt": str(attempt),
-                "depth": str(depth),
-            },
+            metadata={"service": "divider", "attempt": str(attempt), "depth": str(depth)},
         )
 
-    def _to_service_result(
-        self, parsed: DividerBaseCase | DividerRecursiveCase, attempts_used: int
-    ) -> DividerServiceResult:
+    def _to_service_result(self, parsed: DividerBaseCase | DividerRecursiveCase,
+                           attempts_used: int) -> DividerServiceResult:
         if parsed.decision == DividerDecision.BASE_CASE:
-            base = BaseCaseWorkPlan(
-                rationale=parsed.rationale,
-                work_plan=[step.model_dump() for step in parsed.work_plan],
-                suggested_persona=parsed.suggested_persona,
-                needs_qa=getattr(parsed, "needs_qa", True),
-            )
-            event = DividerDecompositionEvent(
-                event_type="node.decomposed",
-                payload={
-                    "decision": DividerDecision.BASE_CASE.value,
-                    "rationale": parsed.rationale,
-                    "work_plan": [step.model_dump() for step in parsed.work_plan],
-                    "suggested_persona": parsed.suggested_persona,
-                },
-            )
-            return DividerServiceResult(
-                decision=DividerDecision.BASE_CASE, base_case=base,
-                events=(event,), attempts_used=attempts_used,
-            )
+            wp = [s.model_dump() for s in parsed.work_plan]
+            base = BaseCaseWorkPlan(rationale=parsed.rationale, work_plan=wp,
+                                    suggested_persona=parsed.suggested_persona,
+                                    needs_qa=parsed.needs_qa)
+            event = DividerDecompositionEvent("node.decomposed", {
+                "decision": "BASE_CASE", "rationale": parsed.rationale,
+                "work_plan": wp, "suggested_persona": parsed.suggested_persona})
+            return DividerServiceResult(decision=DividerDecision.BASE_CASE,
+                                        base_case=base, events=(event,),
+                                        attempts_used=attempts_used)
 
-        recursive = RecursiveDecomposition(
-            rationale=parsed.rationale,
-            children=[
-                RecursiveChildSpec(
-                    objective=child.objective,
-                    dependencies=list(child.dependencies),
-                    suggested_persona=child.suggested_persona,
-                    interface_contract=child.interface_contract,
-                    needs_qa=getattr(child, "needs_qa", True),
-                )
-                for child in parsed.children
-            ],
-        )
-        event = DividerDecompositionEvent(
-            event_type="node.decomposed",
-            payload={
-                "decision": DividerDecision.RECURSIVE_CASE.value,
-                "rationale": parsed.rationale,
-                "children": [child.model_dump() for child in parsed.children],
-            },
-        )
-        return DividerServiceResult(
-            decision=DividerDecision.RECURSIVE_CASE, recursive_case=recursive,
-            events=(event,), attempts_used=attempts_used,
-        )
+        children = [RecursiveChildSpec(objective=c.objective,
+                                       dependencies=list(c.dependencies),
+                                       suggested_persona=c.suggested_persona,
+                                       interface_contract=c.interface_contract,
+                                       needs_qa=c.needs_qa) for c in parsed.children]
+        event = DividerDecompositionEvent("node.decomposed", {
+            "decision": "RECURSIVE_CASE", "rationale": parsed.rationale,
+            "children": [c.model_dump() for c in parsed.children]})
+        return DividerServiceResult(decision=DividerDecision.RECURSIVE_CASE,
+                                    recursive_case=RecursiveDecomposition(
+                                        rationale=parsed.rationale, children=children),
+                                    events=(event,), attempts_used=attempts_used)
 
 
 __all__ = [

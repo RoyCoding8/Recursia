@@ -22,6 +22,15 @@ function formatMs(ms?: number): string {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
+function formatTokens(tokens?: number): string {
+  if (typeof tokens !== "number") {
+    return "—";
+  }
+  if (tokens < 1000) return `${tokens}`;
+  if (tokens < 1_000_000) return `${(tokens / 1000).toFixed(1)}k`;
+  return `${(tokens / 1_000_000).toFixed(2)}M`;
+}
+
 export function RunMetricsBar({ run, nodes, streamConnected, streamError, terminalReason }: RunMetricsBarProps) {
   const completed = nodes.filter((node) => node.status === "completed" || node.status === "merged").length;
   const running = nodes.filter((node) => node.status === "running").length;
@@ -76,6 +85,11 @@ export function RunMetricsBar({ run, nodes, streamConnected, streamError, termin
       <div className="metricItem">
         <span className="metricLabel">Total Duration</span>
         <strong className="metricValue">{formatMs(totalDuration)}</strong>
+      </div>
+
+      <div className="metricItem">
+        <span className="metricLabel">Tokens</span>
+        <strong className="metricValue">{formatTokens(run?.tokensUsed)}</strong>
       </div>
 
       <div className="metricItem streamMetric" data-connected={streamConnected}>

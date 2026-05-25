@@ -4,6 +4,7 @@ import { useState } from "react";
 
 import { ApiError, apiClient } from "@/lib/api";
 import { inferDecision } from "@/lib/decisionUtils";
+import { snippetFromUnknown } from "@/lib/formatUtils";
 import { runStore } from "@/state/runStore";
 import type { Node } from "@/types/contracts";
 import { InterventionPanel } from "@/components/InterventionPanel";
@@ -12,22 +13,6 @@ interface NodeDetailsDrawerProps {
   node?: Node;
   isOpen: boolean;
   onClose: () => void;
-}
-
-function snippetFromUnknown(value: unknown): string {
-  if (value == null) {
-    return "No data available.";
-  }
-
-  if (typeof value === "string") {
-    return value;
-  }
-
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
 }
 
 export function NodeDetailsDrawer({ node, isOpen, onClose }: NodeDetailsDrawerProps) {

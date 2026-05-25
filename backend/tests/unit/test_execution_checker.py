@@ -1,20 +1,26 @@
 """Tests for execution-based checker and test generator integration."""
 from __future__ import annotations
 
-import json
-from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
+from app.adapters.llm_client import LLMResult, LLMUsage
 from app.sandbox.executor import (
-    ExecResult, SandboxExecutor, SuiteResult, TestCase, TestResult,
+    ExecResult,
+    SuiteResult,
+    TestCase,
+    TestResult,
 )
-from app.services.checker import CheckerRequest, CheckerScope, LLMCheckerClient
+from app.services.checker import CheckerRequest, CheckerScope
 from app.services.execution_checker import (
-    ExecutionCheckerClient, _extract_code, _extract_language,
-    _extract_test_hints, _suite_to_checker_result,
+    ExecutionCheckerClient,
+    _extract_code,
+    _extract_language,
+    _extract_test_hints,
+    _suite_to_checker_result,
 )
 from app.services.test_generator import GeneratedTests, ScriptTest, TestGeneratorService
+
+_ZERO_USAGE = LLMUsage(0, 0, 0)
 
 
 class TestExtractCode:
@@ -71,14 +77,14 @@ class TestExtractTestHints:
 class TestSuiteToCheckerResult:
     def test_all_passed(self):
         suite = SuiteResult(passed=5, failed=0, total=5)
-        result = _suite_to_checker_result(suite, "test obj")
+        result = _suite_to_checker_result(suite)
         assert result["verdict"] == "pass"
         assert "5 tests passed" in result["reason"]
         assert result["violations"] == []
 
     def test_compile_error(self):
         suite = SuiteResult(passed=0, failed=3, total=3, compile_error="syntax error")
-        result = _suite_to_checker_result(suite, "test obj")
+        result = _suite_to_checker_result(suite)
         assert result["verdict"] == "fail"
         assert "Compilation failed" in result["reason"]
 
@@ -91,7 +97,7 @@ class TestSuiteToCheckerResult:
                        error="wrong answer"),
         ]
         suite = SuiteResult(passed=1, failed=1, total=2, results=results)
-        result = _suite_to_checker_result(suite, "test obj")
+        result = _suite_to_checker_result(suite)
         assert result["verdict"] == "fail"
         assert "1/2 tests failed" in result["reason"]
         assert len(result["violations"]) == 1
@@ -104,7 +110,7 @@ class TestSuiteToCheckerResult:
                        error="timeout (10.0s)"),
         ]
         suite = SuiteResult(passed=0, failed=1, total=1, results=results)
-        result = _suite_to_checker_result(suite, "test obj")
+        result = _suite_to_checker_result(suite)
         assert result["verdict"] == "fail"
         assert "Optimize" in result["suggested_fix"] or "timed out" in result["suggested_fix"]
 
@@ -112,13 +118,16 @@ class TestSuiteToCheckerResult:
 class TestTestGeneratorService:
     def test_parse_valid_response(self):
         mock_llm = MagicMock()
-        mock_llm.generate_json.return_value = {
-            "test_cases": [
-                {"name": "t1", "input": "5", "expected": "10", "category": "basic"},
-                {"name": "t2", "input": "0", "expected": "0", "category": "edge"},
-            ],
-            "coverage_notes": "basic + edge"
-        }
+        mock_llm.generate_json.return_value = LLMResult(
+            data={
+                "test_cases": [
+                    {"name": "t1", "input": "5", "expected": "10", "category": "basic"},
+                    {"name": "t2", "input": "0", "expected": "0", "category": "edge"},
+                ],
+                "coverage_notes": "basic + edge"
+            },
+            usage=_ZERO_USAGE,
+        )
         gen = TestGeneratorService(mock_llm)
         tests = gen.generate("double the input")
         assert len(tests) == 2
@@ -129,35 +138,43 @@ class TestTestGeneratorService:
 
     def test_parse_list_response(self):
         mock_llm = MagicMock()
-        mock_llm.generate_json.return_value = [
-            {"name": "t1", "input": "1", "expected": "2"},
-        ]
+        mock_llm.generate_json.return_value = LLMResult(
+            data=[{"name": "t1", "input": "1", "expected": "2"}],
+            usage=_ZERO_USAGE,
+        )
         gen = TestGeneratorService(mock_llm)
         tests = gen.generate("increment")
         assert len(tests) == 1
 
     def test_parse_empty(self):
         mock_llm = MagicMock()
-        mock_llm.generate_json.return_value = {"test_cases": []}
+        mock_llm.generate_json.return_value = LLMResult(
+            data={"test_cases": []}, usage=_ZERO_USAGE,
+        )
         gen = TestGeneratorService(mock_llm)
         assert gen.generate("nothing") == []
 
     def test_parse_garbage(self):
         mock_llm = MagicMock()
-        mock_llm.generate_json.return_value = "not json"
+        mock_llm.generate_json.return_value = LLMResult(
+            data="not json", usage=_ZERO_USAGE,
+        )
         gen = TestGeneratorService(mock_llm)
         assert gen.generate("nothing") == []
 
     def test_parse_script_response(self):
         mock_llm = MagicMock()
-        mock_llm.generate_json.return_value = {
-            "test_script": {
-                "language": "python",
-                "code": "assert foo(1) == 2\nprint('PASS')",
-                "expected_stdout": "PASS",
+        mock_llm.generate_json.return_value = LLMResult(
+            data={
+                "test_script": {
+                    "language": "python",
+                    "code": "assert foo(1) == 2\nprint('PASS')",
+                    "expected_stdout": "PASS",
+                },
+                "coverage_notes": "unit test"
             },
-            "coverage_notes": "unit test"
-        }
+            usage=_ZERO_USAGE,
+        )
         gen = TestGeneratorService(mock_llm)
         result = gen.generate_full("test foo")
         assert result.script is not None

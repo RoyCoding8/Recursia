@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
 from datetime import UTC, datetime
 
@@ -9,8 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.events import router as events_router
-from app.api.events import stream_run_events
-from app.api.events import set_event_stream_service
+from app.api.events import set_event_stream_service, stream_run_events
 from app.domain.events import DomainEvent, DomainEventType
 from app.services.event_stream import EventStreamService, format_sse
 from app.state.memory_repo import InMemoryRunStateRepository

@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
 
-import pytest
-
-from app.adapters.llm_client import LLMGenerateRequest
+from app.adapters.llm_client import LLMGenerateRequest, LLMResult, LLMUsage
 from app.domain.events import DomainEventType
 from app.services.executor import WorkExecutionResult
 from app.services.persona_registry import PersonaProfile
 from app.services.worker import LLMBaseCaseWorker
+
+_ZERO_USAGE = LLMUsage(0, 0, 0)
 
 
 class StubLLMClient:
@@ -19,11 +18,11 @@ class StubLLMClient:
         self._responses = list(responses)
         self.calls: list[LLMGenerateRequest] = []
 
-    def generate_json(self, request: LLMGenerateRequest) -> object:
+    def generate_json(self, request: LLMGenerateRequest) -> LLMResult:
         self.calls.append(request)
         if not self._responses:
             raise AssertionError("No stub responses remaining")
-        return self._responses.pop(0)
+        return LLMResult(data=self._responses.pop(0), usage=_ZERO_USAGE)
 
 
 class StubPersonaRegistry:
@@ -176,11 +175,11 @@ def test_worker_stops_on_first_step_failure() -> None:
     call_count = 0
 
     class FailOnSecondLLM:
-        def generate_json(self, request: LLMGenerateRequest) -> object:
+        def generate_json(self, request: LLMGenerateRequest) -> LLMResult:
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return {"reasoning": "ok", "output": "step1"}
+                return LLMResult(data={"reasoning": "ok", "output": "step1"}, usage=_ZERO_USAGE)
             raise RuntimeError("step 2 exploded")
 
     registry = StubPersonaRegistry()

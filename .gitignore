@@ -1,3 +1,7 @@
+# Local test runner
+tests.bat
+tests.sh
+
 # OS / editor
 .DS_Store
 Thumbs.db
@@ -49,7 +53,9 @@ frontend/coverage/
 frontend/playwright-report/
 frontend/test-results/
 frontend/.turbo/
+*.tsbuildinfo
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+*.tsbuildinfo

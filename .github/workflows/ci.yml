@@ -40,6 +40,10 @@ jobs:
         working-directory: backend
         run: uv sync --frozen --all-groups
 
+      - name: Lint backend (ruff)
+        working-directory: backend
+        run: uv run ruff check .
+
       - name: Run backend tests
         working-directory: backend
         run: uv run pytest -q
@@ -55,6 +59,10 @@ jobs:
       - name: Run frontend component tests
         working-directory: frontend
         run: npm run test:components
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
 
       - name: Validate Linux/macOS launcher syntax
         if: runner.os != 'Windows'
