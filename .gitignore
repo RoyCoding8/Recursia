@@ -59,3 +59,5 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 *.tsbuildinfo
+backend/recursia.db-shm
+backend/recursia.db-wal
